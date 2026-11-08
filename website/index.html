@@ -1,0 +1,1465 @@
+<!DOCTYPE html>
+<!--
+  =====================================================================================
+  Lamba Smart Hydroponics: dashboard (index.html)
+  =====================================================================================
+  One self-contained page, hosted as a static file on Cloudflare together with
+  admin-setup.html. Full system guide: "Lamba Smart Hydroponics - System Guide".
+
+  MODES
+    Preview (default, anyone with the link): connects to HiveMQ with the public
+      subscribe-only login (VIEWER_MQTT). Everything is visible, nothing can be changed.
+      Log + Admin tabs and the connection status are hidden.
+    Admin (after "Admin login"): the Worker checks the password and returns the
+      full-control HiveMQ login, which is never stored in this file. Commands go through
+      sendCommand(), which also records who did what (POST /audit).
+
+  SETTINGS TO CHANGE (top of the script section below)
+    BROKER_URL   HiveMQ cluster WebSocket address  wss://<cluster-host>:8884/mqtt
+    VIEWER_MQTT  public subscribe-only login        (username is case-sensitive)
+    API_BASE     Cloudflare Worker URL              (no trailing slash)
+
+  SCRIPT LAYOUT (in order)
+    settings -> shelf rendering + planting-date tags -> log panel -> KSA time helpers
+    -> schedule tab (gauges, switch times, sliders, save/reset) -> uptime box
+    -> MQTT connection + message handler (onMqttMessage) -> admin login/session
+    -> admin panel -> start-up (initAuth)
+
+  MQTT topics are listed in the System Guide (Code reference -> MQTT topics).
+  All times are shown in KSA (Asia/Riyadh), 12-hour format.
+  =====================================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Smart Hydroponics System</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js"></script>
+<style>
+  :root {
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    --shelf: #f2f0e6; --text: #16261f;
+    --pump-blue: #8fd7f0; --pump-blue-dark: #58b3d6; --pipe-off: #ccd6d0;
+    --ok: #4cb86a; --off: #9aa89f;
+    --font-ui: 'Quicksand', system-ui, sans-serif; --font-mono: 'JetBrains Mono', monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; color: var(--text); font-family: var(--font-ui); overflow-x: hidden;
+    background: linear-gradient(160deg, #12503f 0%, #1d8a68 45%, #3fb98a 100%); min-height: 100%; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 16px 18px 60px; }
+  @media (max-width: 820px) { .wrap { padding-right: 58px; } }
+
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding-top: env(safe-area-inset-top,0px); margin-bottom: 6px; flex-wrap: wrap; }
+  .logo { height: 48px; width: auto; flex-shrink: 0; }
+  .title-block { text-align: center; flex: 1; }
+  h1 { font-size: 1.35rem; font-weight: 700; margin: 0; color: #eafff0; }
+
+  .mode-switch { display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.15);
+    border-radius: 999px; padding: 4px; flex-shrink: 0; }
+  .mode-switch span { font-family: var(--font-mono); font-size: .72rem; color: #eafff0; padding: 0 4px; }
+  .mode-toggle { width: 46px; height: 24px; border-radius: 12px; background: #2a3a30; border: none;
+    cursor: pointer; position: relative; flex-shrink: 0; transition: background .2s ease; }
+  .mode-toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px;
+    border-radius: 50%; background: #fff; transition: transform .2s ease; }
+  .mode-toggle.auto { background: var(--ok); }
+  .mode-toggle.auto::after { transform: translateX(22px); }
+
+  .status-row { display: flex; align-items: center; justify-content: flex-start; gap: 6px;
+    font-family: var(--font-mono); font-size: .78rem; color: #d3f5e2; margin-bottom: 4px; }
+  .light { width: 12px; height: 12px; border-radius: 50%; background: var(--off); transition: all .3s ease; }
+  .light.on { background: var(--ok); box-shadow: 0 0 8px 2px rgba(76,184,106,0.6); }
+  .light.bad { background: #d64d3f; box-shadow: 0 0 8px 2px rgba(214,77,63,0.5); }
+  .manual-banner { text-align: center; font-family: var(--font-mono); font-size: .74rem; color: #ffe1a8;
+    margin-bottom: 16px; }
+
+  .plumbing { position: relative; padding-left: 30px; margin-top: 16px; }
+  .trunk { position: absolute; left: 6px; top: 6px; bottom: 6px; width: 9px; border-radius: 5px; background: var(--pipe-off); }
+  .trunk.flowing { background: repeating-linear-gradient(180deg, #bfe9fb 0 9px, var(--pump-blue-dark) 9px 18px);
+    background-size: 100% 18px; animation: flowV .5s linear infinite; }
+  @keyframes flowV { from { background-position-y: 18px; } to { background-position-y: 0; } }
+  @keyframes flowH { from { background-position-x: -18px; } to { background-position-x: 0; } }
+  .shelf-block { position: relative; margin-bottom: 22px; transition: opacity .3s; }
+  .shelf-block.unused { opacity: .45; }
+  .unused-tag { display: none; font-family: var(--font-mono); font-size: .7rem; color: #fff; background: rgba(0,0,0,0.28);
+    border-radius: 999px; padding: 3px 9px; white-space: nowrap; }
+  .shelf-block.unused .unused-tag { display: inline-block; }
+  /* Master switch panel */
+  .master-note { font-size: .78rem; color: #666; line-height: 1.45; margin: -4px 0 14px; }
+  .master-row { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 10px 0; border-bottom: 1px solid #eee; }
+  .master-row .mr-name { font-weight: 700; font-size: .9rem; }
+  .master-row .mr-sub { font-family: var(--font-mono); font-size: .72rem; color: #888; }
+  .en-toggle { border: none; cursor: pointer; border-radius: 999px; padding: 7px 14px; min-width: 96px;
+    font-family: var(--font-ui); font-weight: 700; font-size: .78rem; }
+  .en-toggle.on { background: #1d8a68; color: #fff; }
+  .en-toggle.off { background: #eceff1; color: #78909c; }
+  .pump-ovr { display: flex; gap: 8px; margin: 6px 0 8px; }
+  .pump-ovr button { flex: 1; border: 2px solid #dfe6e9; background: #fff; color: #546e7a; border-radius: 10px;
+    padding: 10px 6px; font-family: var(--font-ui); font-weight: 700; font-size: .85rem; cursor: pointer; }
+  .pump-ovr button.active.on  { background: #58b3d6; border-color: #3a8fb4; color: #fff; }
+  .pump-ovr button.active.off { background: #78909c; border-color: #607d8b; color: #fff; }
+  .ovr-status { font-size: .78rem; color: #666; line-height: 1.45; }
+  .ovr-status.warn { color: #c0392b; font-weight: 600; }
+  .pump-tag { display: none; font-family: var(--font-mono); font-size: .7rem; color: #fff; background: rgba(0,0,0,0.28);
+    border-radius: 999px; padding: 3px 9px; margin-left: 8px; white-space: nowrap; }
+  .pump-tag.show { display: inline-block; }
+  .branch { position: absolute; left: -24px; top: 46px; width: 24px; height: 8px; border-radius: 4px; background: var(--pipe-off); }
+  .branch.flowing { background: repeating-linear-gradient(90deg, #bfe9fb 0 9px, var(--pump-blue-dark) 9px 18px);
+    background-size: 18px 100%; animation: flowH .5s linear infinite; }
+  .shelf-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .shelf-name-wrap { display: flex; align-items: center; gap: 8px; }
+  .chip-wrap { position: relative; display: inline-flex; }
+  .plant-chip { border: none; background: rgba(255,255,255,0.18); color: #eafff0; font-family: var(--font-mono);
+    font-size: .72rem; padding: 5px 10px; border-radius: 999px; cursor: pointer; white-space: nowrap; }
+  .plant-chip.unset { opacity: .7; }
+  body.preview .plant-chip { cursor: default; }
+  body.preview .plant-chip.unset { display: none; }
+  .plant-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 15; background: #fff; border-radius: 10px;
+    padding: 10px; box-shadow: 0 6px 18px rgba(0,0,0,0.25); display: none; gap: 6px; align-items: center; }
+  .plant-pop.open { display: flex; }
+  .plant-pop input { border: 1px solid #ccd6d0; border-radius: 6px; padding: 5px 6px; font-family: var(--font-mono); font-size: .78rem; }
+  .plant-pop button { border: none; border-radius: 6px; padding: 6px 9px; font-family: var(--font-ui); font-weight: 700;
+    font-size: .74rem; cursor: pointer; }
+  .plant-pop .pp-save { background: #1d8a68; color: #fff; }
+  .plant-pop .pp-clear { background: #f1f1f1; color: #666; }
+  .shelf-btn-wrap { display: flex; align-items: center; gap: 8px; }
+  .shelf-light { width: 10px; height: 10px; border-radius: 50%; background: #9aa89f; flex-shrink: 0;
+    transition: background-color .5s ease, box-shadow .5s ease; }
+  .shelf-light.on { background: #4cb86a; box-shadow: 0 0 6px 2px rgba(76,184,106,0.6); }
+  .name-input { background: #fff; color: var(--text); font-weight: 700; font-size: .95rem; font-family: var(--font-ui);
+    padding: 8px 16px; border-radius: 999px; border: none; box-shadow: 0 2px 4px rgba(0,0,0,0.15); }
+  .pillbtn { border: none; cursor: pointer; padding: 10px 26px; border-radius: 999px; font-family: var(--font-ui);
+    font-weight: 700; font-size: .9rem; color: #fff; background: linear-gradient(90deg, #6a6ee0, #e05a7a);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.2); transition: opacity .5s ease, filter .5s ease; }
+  .pillbtn.off { filter: grayscale(.55); opacity: .6; }
+  .pillbtn.locked { cursor: not-allowed; box-shadow: none; }
+  .shelfbar { transition: background-color .7s ease, box-shadow .7s ease; background: var(--shelf); border-radius: 10px; padding: 12px 16px; display: flex;
+    justify-content: space-around; align-items: center; box-shadow: inset 0 -3px 6px rgba(0,0,0,0.08), 0 3px 8px rgba(0,0,0,0.15); }
+  .plant { width: 38px; height: 46px; flex-shrink: 0; transition: opacity .6s ease, filter .6s ease; }
+  .plant.off { opacity: .35; filter: grayscale(.7); }
+  .shelfbar.lit { background: #fff6d6;
+    box-shadow: inset 0 -3px 6px rgba(0,0,0,0.05), 0 0 18px 4px rgba(255,214,120,0.75), 0 3px 8px rgba(0,0,0,0.15); }
+  .tank-row { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; }
+  .tank-wrap { position: relative; flex-shrink: 0; }
+  .tank { width: 110px; height: 66px; border: 5px solid var(--shelf); border-radius: 10px;
+    background: rgba(255,255,255,0.15); position: relative; overflow: hidden;
+    transition: background-color .9s ease; }
+  .tank .water { position: absolute; left: 0; right: 0; bottom: 0; height: 55%; background: var(--pump-blue);
+    transition: height 1.8s cubic-bezier(.4,0,.2,1); }
+  .tank-empty-label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mono); font-weight: 700; font-size: .8rem; color: #ff8a6a; opacity: 0;
+    transition: opacity .9s ease; pointer-events: none; text-align: center; }
+  .tank-wrap::after { content: ''; position: absolute; inset: 0; border-radius: 10px; pointer-events: none;
+    opacity: 0; transition: opacity .9s ease; animation: tankGlow 1.9s ease-in-out infinite; }
+  .tank-wrap.empty .tank { background-color: rgba(70,12,12,0.45); }
+  .tank-wrap.empty .water { height: 0%; }
+  .tank-wrap.empty .tank-empty-label { opacity: 1; animation: emptyPulse 1.9s ease-in-out infinite; }
+  .tank-wrap.empty::after { opacity: 1; }
+  @keyframes emptyPulse {
+    0%, 100% { text-shadow: 0 0 3px rgba(255,100,70,.35); }
+    50% { text-shadow: 0 0 10px rgba(255,110,70,1), 0 0 22px rgba(255,90,60,.85); } }
+  @keyframes tankGlow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,90,60,0); }
+    50% { box-shadow: 0 0 20px 5px rgba(255,90,60,.65); } }
+  .tank-controls { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+
+
+  /* Side tabs */
+  .side-tab { position: fixed; right: 0; transform: translateY(-50%) rotate(180deg);
+    writing-mode: vertical-rl; background: #fff; color: var(--text); font-family: var(--font-ui);
+    font-weight: 700; padding: 14px 8px; border-radius: 10px 0 0 10px; cursor: pointer;
+    box-shadow: -2px 2px 6px rgba(0,0,0,0.2); z-index: 20; letter-spacing: .05em; }
+  #logTab { top: 24%; }
+  #scheduleTab { top: 43%; }
+  #masterTab { top: 62%; }
+  body.preview #scheduleTab { top: 50%; }
+  #adminTab { top: 81%; background: #ffe7a8; }
+  .side-panel { position: fixed; top: 0; right: -320px; width: 300px; height: 100%; background: #fff;
+    box-shadow: -4px 0 12px rgba(0,0,0,0.25); transition: right .35s cubic-bezier(.4,0,.2,1); z-index: 30; padding: 18px 14px;
+    padding-top: calc(18px + env(safe-area-inset-top,0px)); overflow-y: auto; }
+  .side-panel.open { right: 0; }
+  .side-panel h2 { font-size: 1rem; margin: 0 0 12px; }
+  .panel-close { position: absolute; top: 14px; right: 14px; background: none; border: none; font-size: 1.1rem; cursor: pointer; color: #666; }
+  .log-row { display: flex; gap: 12px; padding: 8px 0; font-family: var(--font-mono); font-size: .76rem; border-bottom: 1px solid #eee; color: #444; }
+  .log-row:last-child { border-bottom: none; }
+  .log-time { color: #999; flex-shrink: 0; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.25); opacity: 0; pointer-events: none;
+    transition: opacity .35s ease; z-index: 25; }
+  .overlay.open { opacity: 1; pointer-events: auto; }
+
+  /* Schedule panel */
+  .cycle-status { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+  .radial-wrap { position: relative; width: 100px; height: 100px; flex-shrink: 0; }
+  .radial-wrap svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  .radial-wrap .ring-bg { fill: none; stroke: #e7e7e7; stroke-width: 10; }
+  .radial-wrap .ring-fg { fill: none; stroke-width: 10; stroke-linecap: round; transition: stroke-dashoffset .4s ease, stroke .3s ease; }
+  .radial-center { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 1.4rem; }
+  .cycle-text { font-family: var(--font-mono); font-size: .8rem; color: #333; line-height: 1.5; }
+  .cycle-text .phase { font-weight: 700; font-size: .95rem; display: block; margin-bottom: 2px; }
+  .cycle-manual-note { font-family: var(--font-mono); font-size: .8rem; color: #a86a2a; background: #fff4e0;
+    border-radius: 8px; padding: 10px; margin-bottom: 18px; }
+
+  .cycle-bar { display: flex; height: 26px; border-radius: 13px; overflow: hidden; margin: 14px 0 6px;
+    box-shadow: inset 0 0 0 1px #ddd; }
+  .cycle-on { background: linear-gradient(90deg, #ffd76a, #ff9f4a); display: flex; align-items: center;
+    justify-content: center; font-size: .8rem; }
+  .cycle-off { background: linear-gradient(90deg, #2b3a67, #17203f); display: flex; align-items: center;
+    justify-content: center; font-size: .8rem; }
+  .cycle-labels { display: flex; justify-content: space-between; font-family: var(--font-mono);
+    font-size: .74rem; color: #555; margin-bottom: 18px; }
+  .slider-label { font-size: .82rem; font-weight: 600; margin: 14px 0 4px; color: #333; }
+  input[type=range] { width: 100%; accent-color: #ff9f4a; }
+  .save-btn { width: 100%; margin-top: 16px; padding: 10px; border: none; border-radius: 8px;
+    background: linear-gradient(90deg, #6a6ee0, #e05a7a); color: #fff; font-weight: 700; cursor: pointer;
+    font-family: var(--font-ui); }
+  .saved-note { font-size: .74rem; color: #4cb86a; text-align: center; margin-top: 8px; height: 14px; }
+  .current-sched { font-family: var(--font-mono); font-size: .78rem; color: #555; text-align: center; margin-top: 4px; }
+
+  .ksa-clock { font-family: var(--font-mono); font-size: .76rem; color: #555; background: #f4f7f5;
+    border-radius: 8px; padding: 6px 10px; margin: -4px 0 14px; }
+  .time-input { width: 100%; padding: 8px 10px; border: 1px solid #ccd6d0; border-radius: 8px;
+    font-family: var(--font-mono); font-size: .9rem; }
+  .time-input:disabled { background: #f4f7f5; color: #555; }
+  .switch-times { font-family: var(--font-mono); font-size: .78rem; color: #333; background: #f7f9f8;
+    border: 1px solid #e6ece8; border-radius: 8px; padding: 8px 10px; margin: -6px 0 16px; line-height: 1.7; }
+  .switch-times b { font-family: var(--font-ui); }
+  .uptime-box { font-family: var(--font-mono); font-size: .74rem; color: #333; background: #f4f7f5;
+    border: 1px solid #e6ece8; border-radius: 8px; padding: 8px 10px; margin: -4px 0 14px; line-height: 1.7; }
+  .uptime-box .muted { color: #999; }
+  .panel-divider { border: none; border-top: 1px solid #eee; margin: 26px 0 18px; }
+  .pump-on { background: linear-gradient(90deg, #bfe9fb, #58b3d6); display: flex; align-items: center;
+    justify-content: center; font-size: .8rem; }
+  .pump-off { background: linear-gradient(90deg, #dfe6e9, #b6c3c8); display: flex; align-items: center;
+    justify-content: center; font-size: .8rem; }
+  input[type=range].pump-range { accent-color: #58b3d6; }
+  .reset-btn { width: 100%; margin-top: 8px; padding: 10px; border-radius: 8px; cursor: pointer;
+    font-family: var(--font-ui); font-weight: 700; background: #fff; color: #c0392b; border: 1px solid #e3b5ae; }
+  .reset-note { font-size: .72rem; color: #888; text-align: center; margin-top: 6px; line-height: 1.4; }
+  .save-btn.pump-save { background: linear-gradient(90deg, #58b3d6, #3a7fc4); }
+
+  /* ---- Preview (view-only) vs admin ---- */
+  body.preview .admin-only { display: none !important; }
+  body.preview .mode-toggle { cursor: default; opacity: .85; }
+  body.preview .name-input { cursor: default; }
+  .status-spacer { flex: 1; }
+  input[type=range]:disabled { opacity: .75; cursor: default; }
+  .auth-btn { border: none; cursor: pointer; font-family: var(--font-ui); font-weight: 700; font-size: .78rem;
+    color: #12503f; background: #fff; border-radius: 999px; padding: 5px 14px; box-shadow: 0 2px 4px rgba(0,0,0,0.15); }
+  .user-label { font-family: var(--font-mono); font-size: .74rem; color: #fff3c4; }
+
+  /* ---- Login modal ---- */
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: none; align-items: center;
+    justify-content: center; z-index: 50; padding: 18px; }
+  .modal.open { display: flex; }
+  .modal-card { position: relative; background: #fff; border-radius: 14px; padding: 22px 20px 18px; width: 100%;
+    max-width: 320px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); }
+  .modal-card h2 { margin: 0 0 14px; font-size: 1.05rem; }
+  .modal-card input { width: 100%; padding: 10px 12px; margin-bottom: 10px; border: 1px solid #ccd6d0;
+    border-radius: 8px; font-family: var(--font-ui); font-size: .95rem; }
+  .login-link { display: block; text-align: center; margin-top: 12px; font-size: .8rem; color: #1d8a68;
+    font-weight: 600; text-decoration: none; }
+  .login-link:hover { text-decoration: underline; }
+  .login-error { color: #c0392b; font-size: .8rem; text-align: center; min-height: 18px; margin-top: 8px; }
+
+  /* ---- Admin panel ---- */
+  .admin-sub { font-weight: 700; font-size: .85rem; margin: 18px 0 6px; color: #12503f; }
+  .admin-row { font-family: var(--font-mono); font-size: .72rem; color: #444; padding: 6px 0;
+    border-bottom: 1px solid #eee; line-height: 1.45; }
+  .admin-row b { font-family: var(--font-ui); color: #16261f; }
+  .admin-row .muted { color: #999; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #4cb86a; margin-right: 6px; }
+  .drop-zone { display: block; border: 2px dashed #b9cfc4; border-radius: 12px; padding: 16px 10px; text-align: center;
+    color: #12503f; background: #f6faf8; cursor: pointer; font-size: .85rem; line-height: 1.5; transition: background .2s, border-color .2s; }
+  .drop-zone span { color: #888; font-size: .76rem; }
+  .drop-zone.over { background: #e3f4ec; border-color: #1d8a68; }
+  .fw-hint { font-size: .72rem; color: #888; line-height: 1.45; margin: 6px 0; }
+  .fw-stored { font-family: var(--font-mono); font-size: .72rem; color: #444; background: #f4f7f5; border-radius: 8px;
+    padding: 8px 10px; margin: 8px 0; line-height: 1.6; }
+  .dl-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .dl-row button { border: 1px solid #ccd6d0; background: #fff; border-radius: 8px; padding: 6px 10px; font-size: .74rem;
+    font-family: var(--font-ui); cursor: pointer; }
+  .admin-refresh { background: none; border: 1px solid #ccd6d0; border-radius: 6px; font-size: .72rem;
+    padding: 3px 8px; cursor: pointer; font-family: var(--font-ui); }
+
+  footer { color: #d3f5e2; font-size: .76rem; text-align: center; margin-top: 18px; opacity: .85; }
+</style>
+</head>
+<body class="preview">
+<div class="wrap">
+  <header>
+    <img class="logo" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB2aWV3Qm94PSIwIDAgMTU2LjcyIDkzLjY3Ij48ZGVmcz48Y2xpcFBhdGggaWQ9ImNsaXAtMCI+PHBhdGggY2xpcC1ydWxlPSJub256ZXJvIiBkPSJNIDAuMTMgMCBMIDE1NSAwIEwgMTU1IDQ4IEwgMC4xMyA0OCBaIE0gMC4xMyAwICIvPjwvY2xpcFBhdGg+PGNsaXBQYXRoIGlkPSJjbGlwLTEiPjxwYXRoIGNsaXAtcnVsZT0ibm9uemVybyIgZD0iTSA0OSA2NSBMIDkxIDY1IEwgOTEgOTMuMzUgTCA0OSA5My4zNSBaIE0gNDkgNjUgIi8+PC9jbGlwUGF0aD48Y2xpcFBhdGggaWQ9ImNsaXAtMiI+PHBhdGggY2xpcC1ydWxlPSJub256ZXJvIiBkPSJNIDUgNTMgTCAxMyA1MyBMIDEzIDkzLjM1IEwgNSA5My4zNSBaIE0gNSA1MyAiLz48L2NsaXBQYXRoPjxjbGlwUGF0aCBpZD0iY2xpcC0zIj48cGF0aCBjbGlwLXJ1bGU9Im5vbnplcm8iIGQ9Ik0gOTMgNTIgTCAxMjQgNTIgTCAxMjQgOTMuMzUgTCA5MyA5My4zNSBaIE0gOTMgNTIgIi8+PC9jbGlwUGF0aD48Y2xpcFBhdGggaWQ9ImNsaXAtNCI+PHBhdGggY2xpcC1ydWxlPSJub256ZXJvIiBkPSJNIDE2IDY1IEwgNDYgNjUgTCA0NiA5My4zNSBMIDE2IDkzLjM1IFogTSAxNiA2NSAiLz48L2NsaXBQYXRoPjxjbGlwUGF0aCBpZD0iY2xpcC01Ij48cGF0aCBjbGlwLXJ1bGU9Im5vbnplcm8iIGQ9Ik0gMTI2IDY1IEwgMTU2LjMxIDY1IEwgMTU2LjMxIDkzLjM1IEwgMTI2IDkzLjM1IFogTSAxMjYgNjUgIi8+PC9jbGlwUGF0aD48L2RlZnM+PGcgY2xpcC1wYXRoPSJ1cmwoI2NsaXAtMCkiPjxwYXRoIGZpbGwtcnVsZT0ibm9uemVybyIgZmlsbD0icmdiKDEwMCUsIDEwMCUsIDEwMCUpIiBmaWxsLW9wYWNpdHk9IjEiIGQ9Ik0gMTMzLjI3IDM0LjY0IEMgMTMzLjAxIDM2LjkwIDEzMS44NCAzOC44OSAxMzAuMTUgNDAuMjQgTCAxMzAuMTUgNDAuMjQgQyAxMjguNzIgNDEuMzggMTI2LjkwIDQyLjA3IDEyNC45MyA0Mi4wNyBDIDEyMi45NiA0Mi4wNyAxMjEuMTUgNDEuMzggMTE5LjcyIDQwLjI0IEMgMTE4LjAzIDM4Ljg5IDExNi44NiAzNi45MSAxMTYuNjAgMzQuNjYgQyAxMTYuNTYgMzQuMzMgMTE2LjU0IDM0LjAwIDExNi41NCAzMy42NyBDIDExNi41NCAzMy41NyAxMTYuNTQgMzMuNDYgMTE2LjU1IDMzLjM2IEMgMTE2LjcxIDI4Ljg3IDEyMC40MSAyNS4yOCAxMjQuOTMgMjUuMjggQyAxMjkuNDYgMjUuMjggMTMzLjE2IDI4Ljg3IDEzMy4zMiAzMy4zNiBDIDEzMy4zMiAzMy40NiAxMzMuMzMgMzMuNTcgMTMzLjMzIDMzLjY3IEMgMTMzLjMzIDM0LjAwIDEzMy4zMSAzNC4zMiAxMzMuMjcgMzQuNjQgTSAxNC4xMiAzNS4yNyBDIDkuNDkgMzUuMjcgNS43MyAzMS41MSA1LjczIDI2Ljg4IEMgNS43MyAyMi4yNSA5LjQ5IDE4LjQ4IDE0LjEyIDE4LjQ4IEMgMTguNzUgMTguNDggMjIuNTQgMjIuMjUgMjIuNTQgMjYuODggQyAyMi41NCAzMS41MSAxOC43NSAzNS4yNyAxNC4xMiAzNS4yNyBNIDEzNy4yOCA0MC4yNCBDIDEzNy4yOCA0MC4yNCAxMzcuMjggNDAuMjQgMTM3LjI4IDQwLjI0IEwgMTU0LjA1IDQwLjI0IEMgMTU0LjIxIDQwLjI0IDE1NC4zMyA0MC4xMSAxNTQuMzMgMzkuOTYgTCAxNTQuMzMgNi4zNyBDIDE1NC4zMyA0LjI5IDE1My40NCAyLjMxIDE1MS44NyAwLjk1IEwgMTUwLjg2IDAuMDcgQyAxNTAuNzQgLTAuMDMgMTUwLjU1IC0wLjAxIDE1MC40NSAwLjA5IEwgMTQ3LjEyIDMuOTIgQyAxNDcuMDIgNC4wNSAxNDcuMDMgNC4yMyAxNDcuMTUgNC4zMyBMIDE0OC4xNyA1LjIyIEMgMTQ4LjUwIDUuNTEgMTQ4LjY3IDUuOTMgMTQ4LjY3IDYuMzcgTCAxNDguNjcgMzQuNjQgTCAxMzguODkgMzQuNjQgQyAxMzguOTEgMzQuMzIgMTM4LjkyIDM0LjAwIDEzOC45MiAzMy42NyBDIDEzOC45MiAzMy41NyAxMzguOTIgMzMuNDYgMTM4LjkyIDMzLjM2IEMgMTM4Ljc1IDI1Ljc5IDEzMi41NSAxOS42OCAxMjQuOTMgMTkuNjggQyAxMTcuMzIgMTkuNjggMTExLjExIDI1Ljc5IDExMC45NSAzMy4zNiBDIDExMC45NSAzMy40NiAxMTAuOTQgMzMuNTcgMTEwLjk0IDMzLjY3IEMgMTEwLjk0IDM0LjAwIDExMC45NiAzNC4zMyAxMTAuOTggMzQuNjYgTCAxMDAuNzkgMzQuNjYgTCAxMDAuNzkgMTMuNjQgQyAxMDAuNzkgMTMuNDggMTAwLjY2IDEzLjM1IDEwMC41MCAxMy4zNSBMIDk1LjQ3IDEzLjM1IEMgOTUuMzAgMTMuMzUgOTUuMTcgMTMuNDggOTUuMTcgMTMuNjQgTCA5NS4xNyAzNC42NiBMIDI4LjEwIDM0LjY2IEwgMjguMTAgMTMuNTcgQyAyOC4xMCAxMy40NSAyOC4wNCAxMy4zNSAyNy45MiAxMy4zNSBMIDIyLjc2IDEzLjM1IEMgMjIuNjQgMTMuMzUgMjIuNTQgMTMuNDUgMjIuNTQgMTMuNTcgTCAyMi41NCAxNS43MSBDIDIwLjE5IDEzLjk0IDE3LjI4IDEyLjg5IDE0LjEyIDEyLjg5IEMgNi40MSAxMi44OSAwLjEzIDE5LjE2IDAuMTMgMjYuODggQyAwLjEzIDM0LjU5IDYuNDEgNDAuODcgMTQuMTIgNDAuODcgQyAxNy42MSA0MC44NyAyMC44MyAzOS41NyAyMy4yOCAzNy40NCBDIDIzLjI4IDM3LjQ0IDIzLjI4IDM3LjQ1IDIzLjI4IDM3LjQ1IEwgMjMuMjggMzcuNDUgQyAyNC4yMyAzOS4wOCAyNS45OCA0MC4xOSAyOC4wMCA0MC4yNCBDIDI4LjAwIDQwLjI0IDI4LjAxIDQwLjI0IDI4LjAxIDQwLjI0IEwgMjguMTAgNDAuMjQgTCAyOC4xMCA0MC4yNCBMIDI4LjEwIDQwLjI0IEwgMTEyLjU4IDQwLjI0IEwgOTUuMTcgNDAuMjQgTCAxMTIuNTggNDAuMjQgQyAxMTQuOTQgNDQuNjUgMTE5LjU5IDQ3LjY2IDEyNC45MyA0Ny42NiBDIDEzMC4yOCA0Ny42NiAxMzQuOTIgNDQuNjUgMTM3LjI4IDQwLjI0ICIvPjwvZz48ZyBjbGlwLXBhdGg9InVybCgjY2xpcC0xKSI+PHBhdGggZmlsbC1ydWxlPSJub256ZXJvIiBmaWxsPSJyZ2IoMTAwJSwgMTAwJSwgMTAwJSkiIGZpbGwtb3BhY2l0eT0iMSIgZD0iTSA4OS40MiA4OC4xMiBDIDg5LjA4IDg3LjgzIDg4LjkxIDg3LjQyIDg4LjkxIDg2Ljk4IEwgODguOTEgNzYuMjEgTCA4OC45MSA3Ni4yMSBDIDg4LjkxIDcwLjE5IDg0LjAxIDY1LjI5IDc3Ljk5IDY1LjI5IEMgNzQuNzYgNjUuMjkgNzEuODcgNjYuNzEgNjkuODcgNjguOTQgQyA2Ny44NiA2Ni43MSA2NC45NyA2NS4yOSA2MS43NCA2NS4yOSBDIDU5LjI3IDY1LjI5IDU2Ljk5IDY2LjEyIDU1LjE2IDY3LjUxIEMgNTQuODIgNjcuMDEgNTQuNDIgNjYuNTcgNTMuOTYgNjYuMTcgTCA1Mi45NCA2NS4yOCBDIDUyLjgyIDY1LjE4IDUyLjY0IDY1LjE5IDUyLjUzIDY1LjMxIEwgNDkuMjEgNjkuMTQgQyA0OS4xMCA2OS4yNiA0OS4xMiA2OS40NSA0OS4yNCA2OS41NSBMIDUwLjI2IDcwLjQ0IEMgNTAuNTkgNzAuNzMgNTAuNzggNzEuMTQgNTAuNzggNzEuNTkgTCA1MC43OCA5Mi4zNCBDIDUwLjc4IDkyLjUwIDUwLjg5IDkyLjYyIDUxLjA1IDkyLjYyIEwgNTYuMTQgOTIuNjIgQyA1Ni4zMCA5Mi42MiA1Ni40NCA5Mi41MCA1Ni40NCA5Mi4zNCBMIDU2LjQ0IDc1Ljc5IEMgNTYuNjUgNzMuMDUgNTguOTUgNzAuODkgNjEuNzQgNzAuODkgQyA2NC42OCA3MC44OSA2Ny4wNyA3My4yOCA2Ny4wNyA3Ni4yMSBMIDY3LjA3IDc2LjIxIEwgNjcuMDcgOTIuMzAgQyA2Ny4wNyA5Mi40NiA2Ny4xOSA5Mi41OCA2Ny4zNSA5Mi41OCBMIDcyLjM4IDkyLjU4IEMgNzIuNTQgOTIuNTggNzIuNjYgOTIuNDYgNzIuNjYgOTIuMzAgTCA3Mi42NiA3Ni4yMSBDIDcyLjY2IDczLjI4IDc1LjA1IDcwLjg5IDc3Ljk5IDcwLjg5IEMgODAuOTMgNzAuODkgODMuMzIgNzMuMjggODMuMzIgNzYuMjEgTCA4My4zMiA4Ni45OCBDIDgzLjMyIDg5LjA0IDg0LjE5IDkxIDg1Ljc1IDkyLjM1IEwgODYuNzUgOTMuMjIgQyA4Ni44NyA5My4zMiA4Ny4wNiA5My4zMSA4Ny4xNiA5My4xOSBMIDkwLjQ1IDg5LjQwIEMgOTAuNTUgODkuMjggOTAuNTQgODkuMTAgOTAuNDIgODguOTkgWiBNIDg5LjQyIDg4LjEyICIvPjwvZz48ZyBjbGlwLXBhdGg9InVybCgjY2xpcC0yKSI+PHBhdGggZmlsbC1ydWxlPSJub256ZXJvIiBmaWxsPSJyZ2IoMTAwJSwgMTAwJSwgMTAwJSkiIGZpbGwtb3BhY2l0eT0iMSIgZD0iTSAxMS44NiA4OC4wOCBDIDExLjUyIDg3Ljc5IDExLjI4IDg3LjM3IDExLjI4IDg2LjkyIEwgMTEuMjggNTMuMzggQyAxMS4yOCA1My4yMiAxMS4xNSA1My4wOSAxMC45OSA1My4wOSBMIDUuOTEgNTMuMDkgQyA1Ljc1IDUzLjA5IDUuNjIgNTMuMjIgNS42MiA1My4zOCBMIDUuNjIgODYuODEgQyA1LjYyIDg4LjkzIDYuNTUgOTAuOTYgOC4xNSA5Mi4zNSBMIDkuMTMgOTMuMjAgQyA5LjI3IDkzLjMyIDkuNDkgOTMuMzEgOS42MSA5My4xNyBMIDEyLjg3IDg5LjQxIEMgMTMgODkuMjcgMTIuOTggODkuMDUgMTIuODMgODguOTMgWiBNIDExLjg2IDg4LjA4ICIvPjwvZz48cGF0aCBmaWxsLXJ1bGU9Im5vbnplcm8iIGZpbGw9InJnYigxMDAlLCAxMDAlLCAxMDAlKSIgZmlsbC1vcGFjaXR5PSIxIiBkPSJNIDgwLjgzIDUxLjE1IEMgODAuODMgNDkuMzkgNzkuNDEgNDcuOTcgNzcuNjUgNDcuOTcgQyA3NS45MCA0Ny45NyA3NC40OCA0OS4zOSA3NC40OCA1MS4xNSBDIDc0LjQ4IDUyLjkxIDc1LjkwIDU0LjMzIDc3LjY1IDU0LjMzIEMgNzkuNDEgNTQuMzMgODAuODMgNTIuOTEgODAuODMgNTEuMTUgIi8+PHBhdGggZmlsbC1ydWxlPSJub256ZXJvIiBmaWxsPSJyZ2IoMTAwJSwgMTAwJSwgMTAwJSkiIGZpbGwtb3BhY2l0eT0iMSIgZD0iTSAxOC43OSA3LjgyIEMgMjAuNTQgNy44MiAyMS45NyA2LjQwIDIxLjk3IDQuNjQgQyAyMS45NyAyLjg5IDIwLjU0IDEuNDYgMTguNzkgMS40NiBDIDE3LjAzIDEuNDYgMTUuNjEgMi44OSAxNS42MSA0LjY0IEMgMTUuNjEgNi40MCAxNy4wMyA3LjgyIDE4Ljc5IDcuODIgIi8+PHBhdGggZmlsbC1ydWxlPSJub256ZXJvIiBmaWxsPSJyZ2IoMTAwJSwgMTAwJSwgMTAwJSkiIGZpbGwtb3BhY2l0eT0iMSIgZD0iTSA5LjQ0IDcuODIgQyAxMS4yMCA3LjgyIDEyLjYyIDYuNDAgMTIuNjIgNC42NCBDIDEyLjYyIDIuODkgMTEuMjAgMS40NiA5LjQ0IDEuNDYgQyA3LjY5IDEuNDYgNi4yNiAyLjg5IDYuMjYgNC42NCBDIDYuMjYgNi40MCA3LjY5IDcuODIgOS40NCA3LjgyICIvPjxnIGNsaXAtcGF0aD0idXJsKCNjbGlwLTMpIj48cGF0aCBmaWxsLXJ1bGU9Im5vbnplcm8iIGZpbGw9InJnYigxMDAlLCAxMDAlLCAxMDAlKSIgZmlsbC1vcGFjaXR5PSIxIiBkPSJNIDEwOS42MSA4Ny43MSBDIDEwNS4yNyA4Ny43MSAxMDEuNjkgODQuNDAgMTAxLjI2IDgwLjE3IEwgMTAxLjI2IDc4LjQ2IEMgMTAxLjY5IDc0LjIzIDEwNS4yNyA3MC45MiAxMDkuNjEgNzAuOTIgQyAxMTQuMjQgNzAuOTIgMTE4LjAxIDc0LjY5IDExOC4wMSA3OS4zMiBDIDExOC4wMSA4My45NSAxMTQuMjQgODcuNzEgMTA5LjYxIDg3LjcxIE0gMTA5LjYxIDY1LjMzIEMgMTA2LjQ4IDY1LjMzIDEwMy41OSA2Ni4zNiAxMDEuMjYgNjguMTAgQyAxMDEuMjYgNjguMTAgMTAxLjI2IDY4LjEwIDEwMS4yNiA2OC4xMCBDIDEwMS4yNiA2OC4xMCAxMDEuMjYgNjguMTAgMTAxLjI2IDY4LjEwIEwgMTAxLjI2IDU4Ljc3IEMgMTAxLjI2IDU2LjY5IDEwMC4zMCA1NC43MiA5OC43MyA1My4zNSBMIDk3LjcxIDUyLjQ3IEMgOTcuNTkgNTIuMzcgOTcuNDEgNTIuMzggOTcuMzAgNTIuNTAgTCA5My45OCA1Ni4zMyBDIDkzLjg3IDU2LjQ1IDkzLjg5IDU2LjY0IDk0LjAxIDU2Ljc0IEwgOTUuMDMgNTcuNjIgQyA5NS4zNiA1Ny45MSA5NS42MSA1OC4zMyA5NS42MSA1OC43OCBMIDk1LjYxIDkyLjM0IEMgOTUuNjEgOTIuNTAgOTUuNzMgOTIuNjIgOTUuODkgOTIuNjIgTCAxMDAuOTggOTIuNjIgQyAxMDEuMTQgOTIuNjIgMTAxLjI2IDkyLjUwIDEwMS4yNiA5Mi4zNCBMIDEwMS4yNiA5MC41MyBMIDEwMS4yNiA5MC41NCBDIDEwMy41OSA5Mi4yOCAxMDYuNDggOTMuMzEgMTA5LjYxIDkzLjMxIEMgMTE3LjMzIDkzLjMxIDEyMy42MCA4Ny4wMyAxMjMuNjAgNzkuMzIgQyAxMjMuNjAgNzEuNjAgMTE3LjMzIDY1LjMzIDEwOS42MSA2NS4zMyAiLz48L2c+PGcgY2xpcC1wYXRoPSJ1cmwoI2NsaXAtNCkiPjxwYXRoIGZpbGwtcnVsZT0ibm9uemVybyIgZmlsbD0icmdiKDEwMCUsIDEwMCUsIDEwMCUpIiBmaWxsLW9wYWNpdHk9IjEiIGQ9Ik0gMzguNDcgODAuNTggQyAzNy44OCA4NC42MyAzNC4zOCA4Ny43NSAzMC4xNyA4Ny43NSBDIDI1LjU0IDg3Ljc1IDIxLjc3IDgzLjk4IDIxLjc3IDc5LjM1IEMgMjEuNzcgNzQuNzMgMjUuNTQgNzAuOTYgMzAuMTcgNzAuOTYgQyAzNC4zOCA3MC45NiAzNy44OCA3NC4wOCAzOC40NyA3OC4xNCBaIE0gNDQuNzEgODguMTIgQyA0NC4zNyA4Ny44MyA0NC4xMiA4Ny40MiA0NC4xMiA4Ni45NyBMIDQ0LjEyIDY2LjIzIEMgNDQuMTIgNjYuMDggNDQgNjUuOTUgNDMuODQgNjUuOTUgTCAzOC43NSA2NS45NSBDIDM4LjYwIDY1Ljk1IDM4LjQ3IDY2LjA4IDM4LjQ3IDY2LjIzIEwgMzguNDcgNjguMTEgQyAzNi4xNSA2Ni4zOSAzMy4yOCA2NS4zNiAzMC4xNyA2NS4zNiBDIDIyLjQ1IDY1LjM2IDE2LjE3IDcxLjY0IDE2LjE3IDc5LjM1IEMgMTYuMTcgODcuMDcgMjIuNDUgOTMuMzUgMzAuMTcgOTMuMzUgQyAzMy42MSA5My4zNSAzNi43NiA5Mi4wOSAzOS4xOSA5MC4wMiBDIDM5LjYyIDkwLjkyIDQwLjIzIDkxLjczIDQxLjAwIDkyLjM5IEwgNDEuOTggOTMuMjQgQyA0Mi4xMiA5My4zNyA0Mi4zMyA5My4zNSA0Mi40NiA5My4yMSBMIDQ1LjcyIDg5LjQ2IEMgNDUuODQgODkuMzEgNDUuODMgODkuMTAgNDUuNjggODguOTggWiBNIDQ0LjcxIDg4LjEyICIvPjwvZz48ZyBjbGlwLXBhdGg9InVybCgjY2xpcC01KSI+PHBhdGggZmlsbC1ydWxlPSJub256ZXJvIiBmaWxsPSJyZ2IoMTAwJSwgMTAwJSwgMTAwJSkiIGZpbGwtb3BhY2l0eT0iMSIgZD0iTSAxNDguOTggODAuNTggQyAxNDguMzkgODQuNjMgMTQ0Ljg5IDg3Ljc1IDE0MC42NyA4Ny43NSBDIDEzNi4wNSA4Ny43NSAxMzIuMjggODMuOTggMTMyLjI4IDc5LjM1IEMgMTMyLjI4IDc0LjczIDEzNi4wNSA3MC45NiAxNDAuNjcgNzAuOTYgQyAxNDQuODkgNzAuOTYgMTQ4LjM5IDc0LjA4IDE0OC45OCA3OC4xNCBaIE0gMTU2LjE5IDg4Ljk4IEwgMTU1LjIxIDg4LjEyIEMgMTU0Ljg4IDg3LjgzIDE1NC42MyA4Ny40MiAxNTQuNjMgODYuOTcgTCAxNTQuNjMgNjYuMjMgQyAxNTQuNjMgNjYuMDggMTU0LjUxIDY1Ljk1IDE1NC4zNSA2NS45NSBMIDE0OS4yNiA2NS45NSBDIDE0OS4xMCA2NS45NSAxNDguOTggNjYuMDggMTQ4Ljk4IDY2LjIzIEwgMTQ4Ljk4IDY4LjExIEMgMTQ2LjY2IDY2LjM5IDE0My43OSA2NS4zNiAxNDAuNjcgNjUuMzYgQyAxMzIuOTYgNjUuMzYgMTI2LjY4IDcxLjY0IDEyNi42OCA3OS4zNSBDIDEyNi42OCA4Ny4wNyAxMzIuOTYgOTMuMzUgMTQwLjY3IDkzLjM1IEMgMTQ0LjEyIDkzLjM1IDE0Ny4yNyA5Mi4wOSAxNDkuNzAgOTAuMDIgQyAxNTAuMTMgOTAuOTIgMTUwLjc0IDkxLjczIDE1MS41MSA5Mi4zOSBMIDE1Mi40OSA5My4yNCBDIDE1Mi42MyA5My4zNyAxNTIuODUgOTMuMzUgMTUyLjk3IDkzLjIxIEwgMTU2LjIzIDg5LjQ2IEMgMTU2LjM1IDg5LjMxIDE1Ni4zMyA4OS4xMCAxNTYuMTkgODguOTggIi8+PC9nPjwvc3ZnPg==" alt="Lamba logo">
+    <div class="title-block"><h1>Smart Hydroponics System</h1></div>
+    <div class="mode-switch">
+      <span>Manual</span>
+      <button class="mode-toggle" id="modeToggle" onclick="toggleMode()"></button>
+      <span>Auto</span>
+    </div>
+  </header>
+  <div class="status-row">
+    <span class="light admin-only" id="statusLight"></span><span class="admin-only" id="connLabel">Connecting…</span>
+    <span class="status-spacer"></span>
+    <span class="user-label admin-only" id="userLabel"></span>
+    <button class="auth-btn" id="authBtn" onclick="authButton()">Admin login</button>
+  </div>
+  <div class="manual-banner" id="manualBanner" style="display:none;"></div>
+
+  <div class="plumbing">
+    <div class="trunk" id="trunk"></div>
+    <div id="shelves"></div>
+    <div class="shelf-block">
+      <div class="branch" id="tankBranch" style="top:14px"></div>
+      <div class="tank-row">
+        <div class="tank-wrap" id="tankWrap">
+          <div class="tank"><div class="water"></div><div class="tank-empty-label">Tank empty</div></div>
+        </div>
+        <div class="tank-controls">
+          <button class="pillbtn off" id="pumpBtn" onclick="toggle('pump')">Pump</button>
+          <span class="pump-tag" id="pumpTag"></span>
+        </div>
+      </div>
+      <div style="font-family:var(--font-mono);font-size:.78rem;color:#d3f5e2;">Reservoir</div>
+    </div>
+  </div>
+
+  <footer id="footerText" class="admin-only">Admin mode — changes are recorded under your name.</footer>
+</div>
+
+<div class="overlay" id="overlay" onclick="closeAllPanels()"></div>
+<div class="side-tab admin-only" id="logTab" onclick="openPanel('logPanel')">LOG</div>
+<div class="side-tab" id="scheduleTab" onclick="openPanel('schedulePanel')">SCHEDULE</div>
+<div class="side-tab admin-only" id="masterTab" onclick="openPanel('masterPanel')">MASTER</div>
+<div class="side-tab admin-only" id="adminTab" onclick="openPanel('adminPanel')">ADMIN</div>
+
+<div class="side-panel" id="masterPanel">
+  <button class="panel-close" onclick="closeAllPanels()">✕</button>
+  <h2>Master switch</h2>
+  <div class="master-note">Shelves set to <b>Not in use</b> are skipped by the automatic schedule, so they
+    stay off and save power. Manual mode can still switch them on for demonstrations; they turn off
+    again when Manual mode ends. The setting is kept on the device through restarts.</div>
+  <div id="masterList"></div>
+
+  <hr class="panel-divider">
+  <h2>Pump (maintenance)</h2>
+  <div class="master-note">For emptying the tank or filling the shelves. <b>Pump ON</b> keeps the pump running
+    until you switch it off, even if the tank reads empty. <b>Pump OFF</b> keeps it off.
+    With neither selected, the pump follows the schedule.</div>
+  <div class="pump-ovr">
+    <button id="ovrOn" class="on" onclick="setPumpOverride('on')">Pump ON</button>
+    <button id="ovrOff" class="off" onclick="setPumpOverride('off')">Pump OFF</button>
+  </div>
+  <div class="ovr-status" id="ovrStatus">Pump follows the schedule.</div>
+</div>
+
+<div class="side-panel" id="adminPanel">
+  <button class="panel-close" onclick="closeAllPanels()">✕</button>
+  <h2>Firmware &amp; files</h2>
+  <div class="master-note">Running on the device: <b id="fwVersion">—</b></div>
+  <label class="drop-zone" id="dropZone">
+    <input type="file" id="fwFiles" multiple accept=".bin,.ino" hidden onchange="handleFwFiles(this.files); this.value=''">
+    <b>Drop the .ino.bin and .ino here</b><br>
+    <span>or click to choose files</span>
+  </label>
+  <div class="fw-hint">The device installs the compiled <b>.bin</b> (Arduino IDE → Sketch → Export Compiled Binary).
+    The <b>.ino</b> is kept as the source backup.</div>
+  <div class="fw-stored" id="fwStored">Stored on the server: —</div>
+  <button class="save-btn" onclick="installStoredFirmware()">Install stored firmware on the device</button>
+  <div class="ovr-status" id="otaStatus" style="margin-top:8px"></div>
+  <div class="admin-sub">Download backups</div>
+  <div class="dl-row">
+    <button onclick="downloadSiteFile('index.html')">index.html</button>
+    <button onclick="downloadSiteFile('admin-setup.html')">admin-setup.html</button>
+    <button onclick="downloadStored('ino')">firmware .ino</button>
+    <button onclick="downloadStored('bin')">firmware .bin</button>
+  </div>
+  <div class="fw-hint">The firmware files contain the WiFi and device passwords. Keep downloads private.</div>
+  <hr class="panel-divider">
+  <h2>Admin activity <button class="admin-refresh" onclick="loadAdminOverview()">Refresh</button></h2>
+  <div class="admin-sub">Online now</div>
+  <div id="adminOnline"></div>
+  <div class="admin-sub">Recent actions</div>
+  <div id="adminActions"></div>
+  <div class="admin-sub">Login history</div>
+  <div id="adminLogins"></div>
+
+</div>
+
+<div class="modal" id="loginModal" onclick="if (event.target === this) closeLogin()">
+  <div class="modal-card">
+    <button class="panel-close" onclick="closeLogin()">✕</button>
+    <h2>Admin login</h2>
+    <input id="loginUser" placeholder="Username" autocomplete="username" autocapitalize="none"
+      onkeydown="if (event.key === 'Enter') document.getElementById('loginPass').focus()">
+    <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password"
+      onkeydown="if (event.key === 'Enter') submitLogin()">
+    <button class="save-btn" id="loginSubmit" onclick="submitLogin()">Log in</button>
+    <div class="login-error" id="loginError"></div>
+    <a class="login-link" href="admin-setup.html">+ Create an admin account</a>
+  </div>
+</div>
+
+<div class="side-panel" id="logPanel">
+  <button class="panel-close" onclick="closeAllPanels()">✕</button>
+  <h2>System log</h2>
+  <div class="uptime-box" id="uptimeBox">Device uptime: —</div>
+  <div id="logList"></div>
+</div>
+
+<div class="side-panel" id="schedulePanel">
+  <button class="panel-close" onclick="closeAllPanels()">✕</button>
+  <h2>Light schedule</h2>
+  <div class="ksa-clock">🕘 Time now (KSA): <b id="ksaNow">—</b></div>
+
+  <div class="cycle-status" id="cycleStatus">
+    <div class="radial-wrap">
+      <svg viewBox="0 0 100 100">
+        <circle class="ring-bg" cx="50" cy="50" r="42"></circle>
+        <circle class="ring-fg" id="ringFg" cx="50" cy="50" r="42"
+          stroke-dasharray="264" stroke-dashoffset="264" stroke="#ff9f4a"></circle>
+      </svg>
+      <div class="radial-center" id="radialIcon">🌞</div>
+    </div>
+    <div class="cycle-text">
+      <span class="phase" id="phaseLabel">Waiting for status…</span>
+      <span id="elapsedLabel"></span><br>
+      <span id="remainingLabel"></span>
+    </div>
+  </div>
+  <div class="switch-times" id="lightTimes">—</div>
+  <div class="cycle-manual-note" id="cycleManualNote" style="display:none;">
+    Manual mode: you're controlling the lights. The schedule keeps running and takes over again when Auto resumes.
+  </div>
+
+  <div class="cycle-bar">
+    <div class="cycle-on" id="cycleOn">🌞</div>
+    <div class="cycle-off" id="cycleOff">🌙</div>
+  </div>
+  <div class="cycle-labels"><span id="onLabel">8h on</span><span id="offLabel">16h off</span></div>
+
+  <div class="slider-label">Lights switch on at (KSA time)</div>
+  <input type="time" class="time-input" id="lightStart" step="60">
+
+  <div class="slider-label">Light on (hours)</div>
+  <input type="range" id="onSlider" min="8" max="16" step="0.5" value="8" oninput="onSliderChange(this.value)">
+
+  <div class="slider-label">Light off (hours)</div>
+  <input type="range" id="offSlider" min="8" max="16" step="0.5" value="16" oninput="offSliderChange(this.value)">
+
+  <div class="admin-only">
+  <button class="save-btn" onclick="saveSchedule()">Save schedule to device</button>
+  <div class="saved-note" id="savedNote"></div>
+  </div>
+  <div class="current-sched" id="currentSched">Device schedule: —</div>
+
+  <hr class="panel-divider">
+  <h2>Water pump cycle</h2>
+
+  <div class="cycle-status" id="pumpStatus">
+    <div class="radial-wrap">
+      <svg viewBox="0 0 100 100">
+        <circle class="ring-bg" cx="50" cy="50" r="42"></circle>
+        <circle class="ring-fg" id="pRingFg" cx="50" cy="50" r="42"
+          stroke-dasharray="264" stroke-dashoffset="264" stroke="#58b3d6"></circle>
+      </svg>
+      <div class="radial-center" id="pRadialIcon">💧</div>
+    </div>
+    <div class="cycle-text">
+      <span class="phase" id="pPhaseLabel">Waiting for status…</span>
+      <span id="pElapsedLabel"></span><br>
+      <span id="pRemainingLabel"></span>
+    </div>
+  </div>
+  <div class="switch-times" id="pumpTimes">—</div>
+  <div class="cycle-manual-note" id="pumpOverrideNote" style="display:none;"></div>
+  <div class="cycle-manual-note" id="pumpManualNote" style="display:none;">
+    Manual mode: you're controlling the pump. The cycle keeps running and takes over again when Auto resumes.
+  </div>
+
+  <div class="cycle-bar">
+    <div class="pump-on" id="pCycleOn">💧</div>
+    <div class="pump-off" id="pCycleOff">💤</div>
+  </div>
+  <div class="cycle-labels"><span id="pOnLabel">15m on</span><span id="pOffLabel">15m off</span></div>
+
+  <div class="slider-label">Pump on (minutes)</div>
+  <input type="range" class="pump-range" id="pOnSlider" min="5" max="60" step="5" value="15" oninput="updatePumpBar()">
+
+  <div class="slider-label">Pump off (minutes)</div>
+  <input type="range" class="pump-range" id="pOffSlider" min="5" max="60" step="5" value="15" oninput="updatePumpBar()">
+
+  <div class="admin-only">
+  <button class="save-btn pump-save" onclick="savePumpSchedule()">Save pump cycle to device</button>
+  <div class="saved-note" id="pSavedNote"></div>
+  </div>
+  <div class="current-sched" id="pCurrentSched">Device pump cycle: —</div>
+
+  <div class="admin-only">
+    <hr class="panel-divider">
+    <h2>Start from scratch</h2>
+    <button class="reset-btn" onclick="resetCycles()">↺ Restart both cycles now</button>
+    <div class="reset-note">Lights and pump start a fresh ON period right now, and the lights-on time
+      becomes the current time. Hours/minutes settings are kept.</div>
+    <div class="saved-note" id="resetNote"></div>
+  </div>
+</div>
+
+<script>
+// =============================== SETTINGS ===============================
+// ---------- HiveMQ Cloud connection ----------
+const BROKER_URL = "wss://YOUR-CLUSTER.s1.eu.hivemq.cloud:8884/mqtt";
+// Public, SUBSCRIBE-ONLY credential for preview mode. It's fine that this is visible in
+// the page source: HiveMQ refuses any command sent with it.
+// Admins get the full-control credential from the Worker after logging in.
+const VIEWER_MQTT = { username: "YOUR-VIEWER-USER", password: "YOUR-VIEWER-PASSWORD" };
+// --------------------------------------------
+
+// ---------- Cloudflare Worker (log + admin login) ----------
+const API_BASE = "https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev";
+const LOG_API  = API_BASE + "/logs";
+// -----------------------------------------------------------
+
+// Shelf 1 = bottom shelf ... Shelf 4 = top shelf. Listed here top-to-bottom, the order
+// they appear on the page (so it matches the real rack).
+const CHANNELS = [
+  { key: 'led4', num: 4, name: 'Basil' },
+  { key: 'led3', num: 3, name: 'Mint' },
+  { key: 'led2', num: 2, name: 'Arugula' },
+  { key: 'led1', num: 1, name: 'Arugula' },
+];
+const state = { led1:false, led2:false, led3:false, led4:false, pump:false };
+const logs = [];
+let brokerConnected = false;
+let systemOnline = null;
+let mode = null; // 'auto' | 'manual' | null (unknown)
+let tankDisplay = null;   // what the reservoir graphic currently shows: 'full' | 'empty' | null
+
+const PLANT = (dim) => `
+  <svg class="plant ${dim ? 'off' : ''}" viewBox="0 0 38 46" xmlns="http://www.w3.org/2000/svg">
+    <path d="M9 30 L29 30 L26 44 L12 44 Z" fill="#d8d2bd"/>
+    <line x1="11" y1="34" x2="27" y2="34" stroke="#b9b193" stroke-width="1.5"/>
+    <line x1="12" y1="39" x2="26" y2="39" stroke="#b9b193" stroke-width="1.5"/>
+    <path d="M19 30 C19 22 14 18 10 14" stroke="#2e7d46" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <path d="M19 30 C19 20 24 16 28 12" stroke="#2e7d46" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <path d="M19 30 C19 22 19 18 19 14" stroke="#2e7d46" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <path d="M10 14 C5 12 1 8 0 2 C7 3 13 8 10 14 Z" fill="#4cb86a"/>
+    <path d="M10 14 L1.5 3" stroke="#2e7d46" stroke-width="0.8" fill="none"/>
+    <path d="M28 12 C33 9 36 5 37 0 C31 2 25 6 28 12 Z" fill="#4cb86a"/>
+    <path d="M28 12 L36 1" stroke="#2e7d46" stroke-width="0.8" fill="none"/>
+    <path d="M19 14 C13 10 13 4 19 0 C25 4 25 10 19 14 Z" fill="#5fcf7d"/>
+    <path d="M19 14 L19 1.5" stroke="#2e7d46" stroke-width="0.8" fill="none"/>
+  </svg>`;
+
+let shelvesBuilt = false;
+function renderShelves() {
+  const locked = mode === 'auto' || !isAdmin();
+  if (!shelvesBuilt) {
+    document.getElementById('shelves').innerHTML = CHANNELS.map((ch, i) => `
+    <div class="shelf-block" id="block-${ch.key}">
+      <div class="branch" style="top:46px"></div>
+      <div class="shelf-head">
+        <div class="shelf-name-wrap">
+          <input class="name-input" value="${ch.name}" size="${Math.max(ch.name.length,3)}"
+            oninput="CHANNELS[${i}].name=this.value; this.size=Math.max(this.value.length,3)">
+          <span class="chip-wrap">
+            <button class="plant-chip unset" id="chip-${ch.key}" onclick="togglePlantPop('${ch.key}', event)">🌱 Set date</button>
+            <div class="plant-pop" id="pop-${ch.key}" onclick="event.stopPropagation()">
+              <input type="date" id="date-${ch.key}">
+              <button class="pp-save" onclick="savePlantDate('${ch.key}')">Save</button>
+              <button class="pp-clear" onclick="savePlantDate('${ch.key}', true)" title="Clear date">✕</button>
+            </div>
+          </span>
+        </div>
+        <div class="shelf-btn-wrap">
+          <span class="unused-tag">Not in use</span>
+          <span class="shelf-light" id="light-${ch.key}"></span>
+          <button class="pillbtn" id="btn-${ch.key}" onclick="toggle('${ch.key}')">Shelf ${ch.num}</button>
+        </div>
+      </div>
+      <div class="shelfbar" id="bar-${ch.key}">${Array(5).fill(0).map(() => PLANT(true)).join('')}</div>
+    </div>
+  `).join('');
+    shelvesBuilt = true;
+  }
+  document.querySelectorAll('.name-input').forEach(inp => { inp.readOnly = !isAdmin(); });
+  renderPlantChips();
+  // Update classes in place (no rebuilding) so the CSS transitions animate smoothly
+  CHANNELS.forEach(ch => {
+    const on = state[ch.key];
+    const inUse = shelfEnabled[ch.key] !== false;
+    document.getElementById('block-' + ch.key).classList.toggle('unused', !inUse);
+    const btn = document.getElementById('btn-' + ch.key);
+    btn.classList.toggle('off', !on);
+    btn.classList.toggle('locked', locked);
+    btn.title = !isAdmin() ? 'Preview mode — log in to control'
+              : !inUse && mode === 'auto' ? 'Not in use — the schedule keeps it off (Master tab)'
+              : locked ? 'Controlled by the automatic schedule' : '';
+    const bar = document.getElementById('bar-' + ch.key);
+    bar.classList.toggle('lit', on);
+    bar.querySelectorAll('.plant').forEach(p => p.classList.toggle('off', !on));
+    document.getElementById('light-' + ch.key).classList.toggle('on', on);
+  });
+  updateFlow();
+}
+// ---------- Per-shelf planting dates ----------
+// Stored as retained MQTT messages (hydroponics/ledN/planted = "YYYY-MM-DD"), so every
+// viewer sees them and they survive reloads. Only admins can change them.
+const plantDates = {};   // key -> "YYYY-MM-DD"
+function daysSince(dateStr) {
+  const today = ksaDay(Date.now());                 // "YYYY-MM-DD" in KSA
+  return Math.round((Date.parse(today) - Date.parse(dateStr)) / 86400000);
+}
+function renderPlantChips() {
+  CHANNELS.forEach(ch => {
+    const chip = document.getElementById('chip-' + ch.key);
+    if (!chip) return;
+    const d = plantDates[ch.key];
+    chip.classList.toggle('unset', !d);
+    if (!d) { chip.textContent = '🌱 Set date'; chip.title = 'Set the planting date'; return; }
+    const n = daysSince(d);
+    chip.textContent = n >= 0 ? `🌱 Day ${n + 1}` : `🌱 in ${-n}d`;
+    chip.title = 'Planted ' + new Date(d + 'T12:00:00Z').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  });
+}
+// ---------- Master switch (shelves in use) ----------
+// Stored on the ESP32 (flash) and mirrored as retained MQTT: hydroponics/ledN/enabled/state
+const shelfEnabled = {};   // key -> true/false (missing = in use)
+function renderMaster() {
+  const list = document.getElementById('masterList');
+  if (!list) return;
+  list.innerHTML = CHANNELS.map(ch => {
+    const en = shelfEnabled[ch.key] !== false;
+    return `<div class="master-row">
+      <div><div class="mr-name">Shelf ${ch.num}</div><div class="mr-sub">${escapeHtml(ch.name)}${ch.num === 1 ? ' · bottom' : ch.num === 4 ? ' · top' : ''}</div></div>
+      <button class="en-toggle ${en ? 'on' : 'off'}" onclick="setShelfInUse('${ch.key}', ${!en})">${en ? 'In use' : 'Not in use'}</button>
+    </div>`;
+  }).join('');
+}
+function setShelfInUse(key, en) {
+  const ch = CHANNELS.find(c => c.key === key);
+  sendCommand(`hydroponics/${key}/enabled/set`, en ? '1' : '0',
+    en ? `Shelf ${ch.num} back in use` : `Shelf ${ch.num} taken out of use`);
+}
+
+function closePlantPops() { document.querySelectorAll('.plant-pop.open').forEach(p => p.classList.remove('open')); }
+function togglePlantPop(key, ev) {
+  ev.stopPropagation();
+  if (!isAdmin()) return;
+  const pop = document.getElementById('pop-' + key);
+  const wasOpen = pop.classList.contains('open');
+  closePlantPops();
+  if (wasOpen) return;
+  document.getElementById('date-' + key).value = plantDates[key] || ksaDay(Date.now());
+  pop.classList.add('open');
+}
+document.addEventListener('click', closePlantPops);
+function savePlantDate(key, clear) {
+  const ch = CHANNELS.find(c => c.key === key);
+  const val = clear ? '' : document.getElementById('date-' + key).value;
+  if (!clear && !val) return;
+  if (!isAdmin() || !client || !client.connected) return;
+  // retained, so new visitors get it straight away; an empty retained message clears it
+  client.publish(`hydroponics/${key}/planted`, val, { retain: true });
+  apiFetch('/audit', { method: 'POST', body: JSON.stringify({
+    action: clear ? `Shelf ${ch.num} planting date cleared` : `Shelf ${ch.num} planted on ${val}` }) }).catch(() => {});
+  closePlantPops();
+}
+
+// The log is written ONLY by the ESP32 (via the Cloudflare Worker), so the dashboard
+// never creates entries itself — it shows the stored history plus live lines from MQTT.
+const LOG_SHOW = 50;
+function escapeHtml(t) {
+  return String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtLogTime(ts) {
+  if (!ts) return '';
+  return ksaDay(ts) === ksaDay(Date.now()) ? ksaTime(ts) : `${ksaDate(ts)} ${ksaTime(ts)}`;
+}
+function renderLogs() {
+  const list = document.getElementById('logList');
+  list.innerHTML = logs.length
+    ? logs.map(l => `<div class="log-row"><span class="log-time">${fmtLogTime(l.ts)}</span><span>${escapeHtml(l.msg)}</span></div>`).join('')
+    : '<div class="log-row"><span>No events yet.</span></div>';
+}
+function addLiveLog(msg) {
+  logs.unshift({ ts: Date.now(), msg });
+  logs.length = Math.min(logs.length, LOG_SHOW);
+  renderLogs();
+}
+function loadLogHistory() {
+  fetch(LOG_API, { cache: 'no-store' })
+    .then(r => r.json())
+    .then(history => {
+      if (Array.isArray(history)) {
+        logs.length = 0;
+        logs.push(...history.slice(0, LOG_SHOW));
+        renderLogs();
+      }
+    })
+    .catch(() => { /* Worker not reachable yet — keep whatever is shown */ });
+}
+function openPanel(id) {
+  if (id === 'logPanel') loadLogHistory();   // refresh history each time the log is opened
+  if (id === 'adminPanel') { loadAdminOverview(); refreshFirmwareInfo(); }
+  if (id === 'masterPanel') renderMaster();
+  document.getElementById(id).classList.add('open');
+  document.getElementById('overlay').classList.add('open');
+}
+function closeAllPanels() {
+  document.getElementById('masterPanel').classList.remove('open');
+  document.getElementById('adminPanel').classList.remove('open');
+  document.getElementById('logPanel').classList.remove('open');
+  document.getElementById('schedulePanel').classList.remove('open');
+  document.getElementById('overlay').classList.remove('open');
+}
+
+function isFlowing() { return state.pump && tankDisplay !== 'empty'; }
+function updateFlow() {
+  const f = isFlowing();
+  document.getElementById('trunk').classList.toggle('flowing', f);
+  document.querySelectorAll('.branch').forEach(b => b.classList.toggle('flowing', f));
+}
+
+function setTankDisplay(next) {
+  tankDisplay = next;
+  const empty = next === 'empty';
+  document.getElementById('tankWrap').classList.toggle('empty', empty);
+  updateFlow();
+  updatePumpButton();
+}
+function handleTankState(msg) {
+  // The graphic simply follows the float switch directly now.
+  setTankDisplay(msg === 'empty' ? 'empty' : 'full');
+}
+
+function toggle(key) {
+  if (mode === 'auto') return; // automatic mode owns shelves AND pump (buttons are locked)
+  if (key === 'pump' && (pumpOverride !== 'none' || (tankDisplay === 'empty' && !state.pump))) return;
+  const next = !state[key];
+  const ch = CHANNELS.find(c => c.key === key);
+  const label = key === 'pump' ? 'Pump' : `Shelf ${ch.num}`;
+  sendCommand(`hydroponics/${key}/set`, next ? '1' : '0', `${label} turned ${next ? 'on' : 'off'}`);
+}
+
+function toggleMode() {
+  if (!isAdmin()) return;
+  const next = mode === 'auto' ? 'manual' : 'auto';
+  sendCommand('hydroponics/mode/set', next, `Switched to ${next === 'auto' ? 'automatic' : 'manual'} mode`);
+}
+
+function updateModeUI() {
+  const toggleEl = document.getElementById('modeToggle');
+  toggleEl.classList.toggle('auto', mode === 'auto');
+  document.getElementById('manualBanner').style.display = (mode === 'manual') ? 'block' : 'none';
+  // The schedules never pause, so their status is shown in both modes
+  document.getElementById('cycleManualNote').style.display = (mode === 'manual') ? 'block' : 'none';
+  document.getElementById('pumpManualNote').style.display = (mode === 'manual') ? 'block' : 'none';
+  updatePumpButton();
+  renderShelves();
+}
+
+function updatePumpButton() {
+  const btn = document.getElementById('pumpBtn');
+  const held = pumpOverride !== 'none';
+  const emptyBlock = tankDisplay === 'empty' && !state.pump;   // can't start on an empty tank
+  const locked = mode === 'auto' || !isAdmin() || held || emptyBlock;
+  btn.classList.toggle('off', !state.pump);
+  btn.classList.toggle('locked', locked);
+  btn.title = !isAdmin() ? 'Preview mode — log in to control'
+            : held ? 'Held by the pump maintenance switch (Master tab)'
+            : mode === 'auto' ? 'Controlled by the automatic pump cycle'
+            : emptyBlock ? 'Tank empty — the pump can\'t be started' : '';
+  const tag = document.getElementById('pumpTag');
+  tag.textContent = pumpOverride === 'on' ? 'Held ON' : pumpOverride === 'off' ? 'Held OFF' : '';
+  tag.classList.toggle('show', held);
+  renderPumpOverride();
+}
+
+// ---------- Pump maintenance switch ----------
+let pumpOverride = 'none';   // 'none' | 'on' | 'off', from the device
+function renderPumpOverride() {
+  const on = document.getElementById('ovrOn'), off = document.getElementById('ovrOff');
+  if (!on) return;
+  on.classList.toggle('active', pumpOverride === 'on');
+  off.classList.toggle('active', pumpOverride === 'off');
+  const st = document.getElementById('ovrStatus');
+  const emptyNow = tankDisplay === 'empty';
+  st.classList.toggle('warn', pumpOverride === 'on' && emptyNow);
+  st.textContent = pumpOverride === 'on'
+      ? (emptyNow ? 'Pump held ON and the tank reads EMPTY. Switch it off as soon as the tank is drained.'
+                  : 'Pump held ON. It runs until you switch it off.')
+    : pumpOverride === 'off' ? 'Pump held OFF. Tap Pump OFF again to return to the schedule.'
+    : 'Pump follows the schedule.';
+  const note = document.getElementById('pumpOverrideNote');
+  if (note) {
+    note.style.display = pumpOverride === 'none' ? 'none' : 'block';
+    note.textContent = pumpOverride === 'on' ? 'Maintenance switch: pump held ON until switched off in the Master tab.'
+                     : 'Maintenance switch: pump held OFF until released in the Master tab.';
+  }
+}
+// ---------- Firmware & files (Admin tab) ----------
+// Files are stored by the Worker (admin only). To install, the Worker issues a private
+// 15-minute link and the dashboard tells the ESP32 to download it (hydroponics/ota/set).
+let storedFw = null;
+function fwLine(f) {
+  if (!f) return 'none';
+  return `${escapeHtml(f.name)} · ${(f.size / 1048576).toFixed(2)} MB${f.version ? ' · v' + escapeHtml(f.version) : ''}<br>&nbsp;&nbsp;${fmtWhen(f.at)} by ${escapeHtml(f.by || '?')}`;
+}
+async function refreshFirmwareInfo() {
+  const el = document.getElementById('fwStored');
+  try {
+    const { ok, data } = await apiFetch('/firmware/info');
+    if (!ok) { el.textContent = 'Stored on the server: could not load (is the Worker updated?)'; return; }
+    storedFw = data;
+    el.innerHTML = `<b>Firmware (.bin):</b> ${fwLine(data.bin)}<br><b>Source (.ino):</b> ${fwLine(data.ino)}`;
+  } catch (e) { el.textContent = 'Stored on the server: could not reach the Worker'; }
+}
+async function handleFwFiles(fileList) {
+  const st = document.getElementById('otaStatus');
+  if (!isAdmin()) return;
+  const files = [...fileList];
+  const bin = files.find(f => /\.bin$/i.test(f.name));
+  const ino = files.find(f => /\.ino$/i.test(f.name));
+  if (!bin && !ino) { st.textContent = 'Drop the compiled .bin and/or the .ino source file.'; return; }
+  let version = '';
+  if (ino) { const m = (await ino.text()).match(/FW_VERSION\s*=\s*"([^"]+)"/); if (m) version = m[1]; }
+  if (bin) {
+    const head = new Uint8Array(await bin.slice(0, 1).arrayBuffer());
+    if (head[0] !== 0xE9 || bin.size < 100 * 1024) {
+      st.textContent = `${bin.name} isn't the app firmware. Use the .ino.bin from Sketch → Export Compiled Binary (not bootloader, partitions or merged).`;
+      return;
+    }
+  }
+  for (const [kind, f] of [['bin', bin], ['ino', ino]]) {
+    if (!f) continue;
+    st.textContent = `Uploading ${f.name}…`;
+    try {
+      const r = await fetch(`${API_BASE}/firmware/upload?kind=${kind}`, { method: 'POST', body: f,
+        headers: { Authorization: 'Bearer ' + session.token, 'X-Filename': encodeURIComponent(f.name), 'X-Version': encodeURIComponent(version) } });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { st.textContent = d.error || `Upload failed (${r.status})`; return; }
+    } catch (e) { st.textContent = 'Upload failed: could not reach the Worker.'; return; }
+  }
+  st.textContent = bin ? `Uploaded${version ? ' v' + version : ''}. Press "Install stored firmware on the device" when ready.`
+                       : 'Source saved as a backup. To update the device, also drop the compiled .bin.';
+  refreshFirmwareInfo();
+}
+async function installStoredFirmware() {
+  const st = document.getElementById('otaStatus');
+  if (!storedFw || !storedFw.bin) { st.textContent = 'No firmware stored yet: drop the .ino.bin above first.'; return; }
+  const b = storedFw.bin;
+  if (!confirm(`Install ${b.name}${b.version ? ' (v' + b.version + ')' : ''} on the device?\n\nIt downloads for up to a minute, then restarts. Lights and pump hold their state meanwhile.`)) return;
+  const { ok, data } = await apiFetch('/firmware/ota-link', { method: 'POST' });
+  if (!ok) { st.textContent = (data && data.error) || 'Could not create the download link.'; return; }
+  if (sendCommand('hydroponics/ota/set', data.url, `Firmware install started: ${b.name}${b.version ? ' v' + b.version : ''}`))
+    st.textContent = 'Sent to the device… watch for "Update installed - restarting".';
+  else st.textContent = 'Not connected to the device right now.';
+}
+function saveBlob(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+async function downloadSiteFile(name) {
+  const st = document.getElementById('otaStatus');
+  try {
+    const r = await fetch(name, { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status);
+    saveBlob(await r.blob(), name);
+  } catch (e) { st.textContent = `Couldn't download ${name} (this works on the live site, not a local copy).`; }
+}
+async function downloadStored(kind) {
+  const st = document.getElementById('otaStatus');
+  try {
+    const r = await fetch(`${API_BASE}/firmware/file?kind=${kind}`, { headers: { Authorization: 'Bearer ' + session.token }, cache: 'no-store' });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); st.textContent = d.error || `Download failed (${r.status})`; return; }
+    const cd = r.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename="([^"]+)"/);
+    saveBlob(await r.blob(), m ? m[1] : (kind === 'ino' ? 'hydro.ino' : 'hydro.bin'));
+  } catch (e) { st.textContent = 'Download failed: could not reach the Worker.'; }
+}
+// Drag & drop onto the drop zone
+(function () {
+  const z = document.getElementById('dropZone');
+  ['dragenter', 'dragover'].forEach(ev => z.addEventListener(ev, e => { e.preventDefault(); z.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => z.addEventListener(ev, e => { e.preventDefault(); z.classList.remove('over'); }));
+  z.addEventListener('drop', e => handleFwFiles(e.dataTransfer.files));
+  // A file dropped anywhere else shouldn't make the browser leave the dashboard
+  ['dragover', 'drop'].forEach(ev => window.addEventListener(ev, e => { if (!z.contains(e.target)) e.preventDefault(); }));
+})();
+
+function setPumpOverride(which) {
+  // Tapping the active button releases it (back to the schedule)
+  const next = pumpOverride === which ? 'none' : which;
+  if (next === 'on' && !confirm('Keep the pump ON until you switch it off?\n\nIt will keep running even if the tank reads empty, so stay nearby and switch it off when the tank is drained or the shelves are full.')) return;
+  sendCommand('hydroponics/pump/override/set', next,
+    next === 'on' ? 'Pump held ON (maintenance)' : next === 'off' ? 'Pump held OFF (maintenance)' : 'Pump maintenance switch released');
+}
+
+// ---------- Pump cycle ----------
+function updatePumpBar() {
+  const on = parseInt(document.getElementById('pOnSlider').value, 10);
+  const off = parseInt(document.getElementById('pOffSlider').value, 10);
+  document.getElementById('pCycleOn').style.flex = on;
+  document.getElementById('pCycleOff').style.flex = off;
+  document.getElementById('pOnLabel').textContent = `${on}m on`;
+  document.getElementById('pOffLabel').textContent = `${off}m off`;
+}
+// ---------- KSA (Saudi Arabia, UTC+3) switch times ----------
+const KSA_TZ = 'Asia/Riyadh';
+let devicePumpOnMin = null, devicePumpOffMin = null;
+// All times shown in KSA, 12-hour format (e.g. 6:30 PM)
+function ksaTime(ms) {
+  return new Date(ms).toLocaleTimeString('en-US', { timeZone: KSA_TZ, hour: 'numeric', minute: '2-digit', hour12: true });
+}
+function ksaDate(ms) {
+  return new Date(ms).toLocaleDateString('en-GB', { timeZone: KSA_TZ, day: 'numeric', month: 'short' });
+}
+// "18:30" -> "6:30 PM"
+function fmt12(hhmm) {
+  const [h, m] = String(hhmm).split(':').map(Number);
+  if (isNaN(h) || isNaN(m)) return hhmm;
+  return `${(h % 12) || 12}:${String(m).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`;
+}
+function ksaDay(ms) { return new Date(ms).toLocaleDateString('en-CA', { timeZone: KSA_TZ }); }
+function ksaWhen(ms) {
+  const d = ksaDay(ms);
+  if (d === ksaDay(Date.now())) return `${ksaTime(ms)} today`;
+  if (d === ksaDay(Date.now() + 86400000)) return `${ksaTime(ms)} tomorrow`;
+  return `${ksaTime(ms)} ${ksaDate(ms)}`;
+}
+// ---------- Device uptime (top of the log panel) ----------
+let bootEpoch = 0, connectedEpoch = 0;
+function fmtSpan(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m ${sec % 60}s`;
+}
+function renderUptime() {
+  const box = document.getElementById('uptimeBox');
+  if (systemOnline === false) { box.innerHTML = '🔴 <b>Device offline</b> <span class="muted">(see log for when it drops back in)</span>'; return; }
+  if (!bootEpoch) {
+    box.textContent = clockState === 'waiting'
+      ? '⏳ Device online, getting the internet time. Uptime shows once it has it.'
+      : 'Device uptime: —';
+    return;
+  }
+  const now = Date.now() / 1000;
+  const since = s => (ksaDay(s * 1000) === ksaDay(Date.now()) ? 'today ' : ksaDate(s * 1000) + ' ') + ksaTime(s * 1000);
+  box.innerHTML = `⚡ Powered on for <b>${fmtSpan(now - bootEpoch)}</b> <span class="muted">(since ${since(bootEpoch)})</span>` +
+    (connectedEpoch ? `<br>📶 Connected for <b>${fmtSpan(now - connectedEpoch)}</b> <span class="muted">(since ${since(connectedEpoch)})</span>` : '');
+}
+setInterval(renderUptime, 1000);
+
+function updateKsaClock() {
+  document.getElementById('ksaNow').textContent =
+    new Date().toLocaleTimeString('en-US', { timeZone: KSA_TZ, hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true });
+}
+// Shelf day counters roll over at KSA midnight
+setInterval(() => { if (shelvesBuilt) renderPlantChips(); }, 60 * 1000);
+setInterval(updateKsaClock, 1000);
+
+// ---------- When the live schedule status stops arriving ----------
+// The saved settings (hours, lights-on time, pump minutes) are kept on the broker, but the
+// live gauges need the ESP32 sending its status every second. If that stops, say why
+// instead of leaving "Waiting for status…".
+let lastLightStatusAt = 0, lastPumpStatusAt = 0;
+let clockState = null;   // "synced" | "waiting" from the ESP32
+function showNoLiveStatus(ids) {
+  const offline = systemOnline === false, waiting = !offline && clockState === 'waiting';
+  document.getElementById(ids.phase).textContent =
+    offline ? 'Device offline' : waiting ? 'Getting the time…' : 'No live status';
+  document.getElementById(ids.elapsed).textContent =
+    offline ? 'Schedule resumes when it reconnects'
+    : waiting ? 'Relays hold their last state until the device has the time'
+    : 'Device may be waiting for internet time';
+  document.getElementById(ids.remaining).textContent = '';
+  document.getElementById(ids.times).textContent = offline
+    ? 'Switch times will show once the device is back online.'
+    : 'Switch times will show once the device reports its status.';
+  document.getElementById(ids.ring).setAttribute('stroke-dashoffset', 264);
+}
+const LIGHT_IDS = { phase: 'phaseLabel', elapsed: 'elapsedLabel', remaining: 'remainingLabel', times: 'lightTimes', ring: 'ringFg' };
+const PUMP_IDS  = { phase: 'pPhaseLabel', elapsed: 'pElapsedLabel', remaining: 'pRemainingLabel', times: 'pumpTimes', ring: 'pRingFg' };
+setInterval(() => {
+  const now = Date.now();
+  if (now - lastLightStatusAt > 5000) showNoLiveStatus(LIGHT_IDS);
+  if (now - lastPumpStatusAt > 5000) showNoLiveStatus(PUMP_IDS);
+}, 2000);
+
+function updatePumpRadial(phase, elapsedSec, totalSec) {
+  // Next switch times in KSA time
+  const nextSwitch = Date.now() + Math.max(0, totalSec - elapsedSec) * 1000;
+  const el = document.getElementById('pumpTimes');
+  if (devicePumpOnMin != null && devicePumpOffMin != null) {
+    const then = nextSwitch + (phase === 'off' ? devicePumpOnMin : devicePumpOffMin) * 60000;
+    el.innerHTML = phase === 'off'
+      ? `💧 Pump <b>ON</b> at ${ksaWhen(nextSwitch)}<br>💤 Pump <b>OFF</b> at ${ksaWhen(then)}`
+      : phase === 'blocked'
+      ? `⚠️ Held off (tank empty) until ${ksaWhen(nextSwitch)}<br>💧 Next <b>ON</b> at ${ksaWhen(then)} if refilled`
+      : `💤 Pump <b>OFF</b> at ${ksaWhen(nextSwitch)}<br>💧 Pump <b>ON</b> at ${ksaWhen(then)}`;
+  }
+
+  const circumference = 264;
+  const frac = totalSec > 0 ? Math.min(1, elapsedSec / totalSec) : 0;
+  const ring = document.getElementById('pRingFg');
+  ring.setAttribute('stroke-dashoffset', circumference * (1 - frac));
+  ring.setAttribute('stroke', phase === 'on' ? '#58b3d6' : phase === 'blocked' ? '#d64d3f' : '#9aa8b0');
+  document.getElementById('pRadialIcon').textContent = phase === 'on' ? '💧' : phase === 'blocked' ? '⚠️' : '💤';
+  const remaining = fmtHMS(Math.max(0, totalSec - elapsedSec));
+  if (phase === 'blocked') {
+    document.getElementById('pPhaseLabel').textContent = 'Held OFF — tank empty';
+    document.getElementById('pElapsedLabel').textContent = 'Resumes when refilled';
+    document.getElementById('pRemainingLabel').textContent = 'On-period ends in ' + remaining;
+    return;
+  }
+  document.getElementById('pPhaseLabel').textContent = phase === 'on' ? 'Pump ON' : 'Pump OFF';
+  document.getElementById('pElapsedLabel').textContent = (phase === 'on' ? 'On for ' : 'Off for ') + fmtHMS(elapsedSec);
+  document.getElementById('pRemainingLabel').textContent = (phase === 'on' ? 'Switches off in ' : 'Switches on in ') + remaining;
+}
+function resetCycles() {
+  if (!confirm('Restart both cycles now?\n\nLights and pump start a fresh ON period right now, and the lights will switch on at this time every day. Your hours/minutes settings are kept.')) return;
+  if (!sendCommand('hydroponics/cycle/reset', 'all', 'Restarted light & pump cycles')) return;
+  const note = document.getElementById('resetNote');
+  note.textContent = 'Cycles reset ✓';
+  setTimeout(() => { note.textContent = ''; }, 3000);
+}
+function savePumpSchedule() {
+  const on = document.getElementById('pOnSlider').value;
+  const off = document.getElementById('pOffSlider').value;
+  if (!sendCommand('hydroponics/pump_schedule/set', `${on},${off}`, `Pump cycle set: ${on} min on / ${off} min off`)) return;
+  const note = document.getElementById('pSavedNote');
+  note.textContent = 'Saved ✓';
+  setTimeout(() => { note.textContent = ''; }, 2500);
+}
+
+// ---------- Schedule sliders ----------
+function fmtHMS(totalSec) {
+  totalSec = Math.max(0, Math.round(totalSec));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  return `${h}h ${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
+}
+function updateRadial(phase, elapsedSec, totalSec) {
+  // Next switch times in KSA time. The two phases always add up to 24h.
+  const nextSwitch = Date.now() + Math.max(0, totalSec - elapsedSec) * 1000;
+  const then = nextSwitch + (24 * 3600 - totalSec) * 1000;
+  document.getElementById('lightTimes').innerHTML = phase === 'on'
+    ? `🌙 Lights <b>OFF</b> at ${ksaWhen(nextSwitch)}<br>🌞 Lights <b>ON</b> at ${ksaWhen(then)}`
+    : `🌞 Lights <b>ON</b> at ${ksaWhen(nextSwitch)}<br>🌙 Lights <b>OFF</b> at ${ksaWhen(then)}`;
+  const circumference = 264; // 2 * PI * 42, matches the SVG circle radius
+  const frac = totalSec > 0 ? Math.min(1, elapsedSec / totalSec) : 0;
+  const ring = document.getElementById('ringFg');
+  ring.setAttribute('stroke-dashoffset', circumference * (1 - frac));
+  ring.setAttribute('stroke', phase === 'on' ? '#ff9f4a' : '#3a4d8f');
+  document.getElementById('radialIcon').textContent = phase === 'on' ? '🌞' : '🌙';
+  document.getElementById('phaseLabel').textContent = phase === 'on' ? 'Currently ON' : 'Currently OFF';
+  document.getElementById('elapsedLabel').textContent =
+    (phase === 'on' ? 'On for ' : 'Off for ') + fmtHMS(elapsedSec);
+  document.getElementById('remainingLabel').textContent =
+    (phase === 'on' ? 'Switches off in ' : 'Switches on in ') + fmtHMS(Math.max(0, totalSec - elapsedSec));
+}
+function updateCycleBar(on) {
+  const off = 24 - on;
+  document.getElementById('cycleOn').style.flex = on;
+  document.getElementById('cycleOff').style.flex = off;
+  document.getElementById('onLabel').textContent = `${on}h on`;
+  document.getElementById('offLabel').textContent = `${off}h off`;
+}
+function onSliderChange(val) {
+  const on = parseFloat(val);
+  document.getElementById('offSlider').value = 24 - on;
+  updateCycleBar(on);
+}
+function offSliderChange(val) {
+  const off = parseFloat(val);
+  const on = 24 - off;
+  document.getElementById('onSlider').value = on;
+  updateCycleBar(on);
+}
+let deviceOnHours = null, deviceLightStart = null;
+function renderDeviceSched() {
+  if (deviceOnHours == null) return;
+  document.getElementById('currentSched').textContent =
+    `Device schedule: ${deviceOnHours}h on / ${24 - deviceOnHours}h off` + (deviceLightStart ? `, from ${fmt12(deviceLightStart)} KSA` : '');
+}
+function saveSchedule() {
+  const on = parseFloat(document.getElementById('onSlider').value);
+  const start = document.getElementById('lightStart').value;   // "HH:MM"
+  const startChanged = start && start !== deviceLightStart;
+  if (!sendCommand('hydroponics/schedule/set', String(on),
+      `Light schedule set: ${on}h on / ${24 - on}h off` + (startChanged ? `, lights on at ${start}` : ''))) return;
+  if (startChanged) client.publish('hydroponics/light_start/set', start);
+  const note = document.getElementById('savedNote');
+  note.textContent = 'Saved ✓';
+  setTimeout(() => { note.textContent = ''; }, 2500);
+}
+
+function updateStatusDisplay() {
+  const light = document.getElementById('statusLight');
+  const label = document.getElementById('connLabel');
+  light.classList.remove('on', 'bad');
+  if (!brokerConnected) {
+    label.textContent = (client && client.reconnecting) ? 'Reconnecting…' : 'Disconnected';
+    light.classList.add('bad');
+  } else if (systemOnline === null) {
+    label.textContent = 'Waiting for system…';
+  } else if (systemOnline) {
+    label.textContent = 'Online';
+    light.classList.add('on');
+  } else {
+    label.textContent = 'System offline';
+    light.classList.add('bad');
+  }
+}
+
+let client = null;
+let everConnected = false;
+function connectMqtt(creds) {
+  if (client) { client.removeAllListeners(); client.end(true); }
+  brokerConnected = false; systemOnline = null; updateStatusDisplay();
+  client = mqtt.connect(BROKER_URL, {
+    username: creds.username,
+    password: creds.password,
+    reconnectPeriod: 2000,   // retry every 2s while disconnected
+    keepalive: 20,           // notice a dead connection within ~30s
+    connectTimeout: 10000,
+  });
+  client.on('connect', () => {
+    // After a reconnect, re-fetch the log so events missed while disconnected show up
+    if (everConnected) loadLogHistory();
+    everConnected = true;
+    brokerConnected = true;
+    updateStatusDisplay();
+    ['led1','led2','led3','led4','pump'].forEach(k => client.subscribe(`hydroponics/${k}/state`));
+    client.subscribe('hydroponics/status');
+    client.subscribe('hydroponics/mode/state');
+    client.subscribe('hydroponics/schedule/state');
+    client.subscribe('hydroponics/manual_remaining');
+    client.subscribe('hydroponics/cycle_status');
+    client.subscribe('hydroponics/pump_schedule/state');
+    client.subscribe('hydroponics/light_start/state');
+    CHANNELS.forEach(ch => client.subscribe(`hydroponics/${ch.key}/planted`));
+    client.subscribe('hydroponics/uptime/boot');
+    client.subscribe('hydroponics/clock/state');
+    CHANNELS.forEach(ch => client.subscribe(`hydroponics/${ch.key}/enabled/state`));
+    client.subscribe('hydroponics/pump/override/state');
+    client.subscribe('hydroponics/firmware/state');
+    client.subscribe('hydroponics/ota/state');
+    client.subscribe('hydroponics/uptime/connected');
+    client.subscribe('hydroponics/pump_cycle_status');
+    client.subscribe('hydroponics/tank/state');
+    client.subscribe('hydroponics/log');
+  });
+  client.on('reconnect', () => { brokerConnected = false; updateStatusDisplay(); });
+  client.on('close', () => { brokerConnected = false; systemOnline = null; updateStatusDisplay(); });
+  client.on('message', onMqttMessage);
+  // Shows WHY a connection fails in the browser console (F12), e.g. "Not authorized"
+  client.on('error', err => console.warn(`MQTT error (${creds.username}):`, err && err.message ? err.message : err));
+}
+
+// Sends a command (admins only) and records who did it in the admin audit trail
+function sendCommand(topic, payload, auditText) {
+  if (!isAdmin() || !client || !client.connected) return false;
+  client.publish(topic, payload);
+  if (auditText) apiFetch('/audit', { method: 'POST', body: JSON.stringify({ action: auditText }) }).catch(() => {});
+  return true;
+}
+
+// ---------- Recover after sleep / background tab / network change ----------
+// Browsers pause or kill connections in background tabs and when a laptop sleeps or a
+// phone locks. When the page becomes visible again (or the network comes back), make
+// sure we have a live connection instead of waiting for the user to refresh.
+let hiddenAt = null;
+function ensureConnected(forceFresh) {
+  if (!client) return;
+  if (!client.connected) {
+    if (!client.reconnecting) client.reconnect();
+  } else if (forceFresh && client.stream) {
+    // After a long absence the socket may look open but be dead — replace it now.
+    // The client's auto-reconnect picks it up within ~2s.
+    client.stream.destroy();
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { hiddenAt = Date.now(); return; }
+  const awayMs = hiddenAt ? Date.now() - hiddenAt : 0;
+  hiddenAt = null;
+  ensureConnected(awayMs > 2 * 60 * 1000);
+  if (isAdmin()) sendHeartbeat();
+});
+window.addEventListener('online', () => ensureConnected(true));
+window.addEventListener('pageshow', e => { if (e.persisted) ensureConnected(true); });
+
+function onMqttMessage(topic, payload) {
+  const msg = payload.toString();
+
+  if (topic === 'hydroponics/status') {
+    systemOnline = (msg === 'online');
+    updateStatusDisplay();
+    return;
+  }
+  if (topic === 'hydroponics/mode/state') {
+    mode = msg;
+    updateModeUI();
+    document.getElementById('manualBanner').textContent =
+      mode === 'manual' ? 'Manual demo mode — reverts to automatic automatically' : '';
+    return;
+  }
+  if (topic === 'hydroponics/schedule/state') {
+    const on = parseFloat(msg);
+    document.getElementById('onSlider').value = on;
+    document.getElementById('offSlider').value = 24 - on;
+    updateCycleBar(on);
+    deviceOnHours = on;
+    renderDeviceSched();
+    return;
+  }
+  if (topic === 'hydroponics/log') {
+    addLiveLog(msg);
+    return;
+  }
+  if (topic === 'hydroponics/tank/state') {
+    handleTankState(msg);
+    return;
+  }
+  if (/^hydroponics\/led[1-4]\/enabled\/state$/.test(topic)) {
+    shelfEnabled[topic.split('/')[1]] = msg !== '0';
+    renderShelves();
+    renderMaster();
+    return;
+  }
+  if (topic === 'hydroponics/firmware/state') { document.getElementById('fwVersion').textContent = msg || '—'; return; }
+  if (topic === 'hydroponics/ota/state')      { document.getElementById('otaStatus').textContent = msg; return; }
+  if (topic === 'hydroponics/pump/override/state') {
+    pumpOverride = (msg === 'on' || msg === 'off') ? msg : 'none';
+    updatePumpButton();
+    return;
+  }
+  if (topic === 'hydroponics/clock/state')      { clockState = msg || null; renderUptime(); return; }
+  if (topic === 'hydroponics/uptime/boot')      { bootEpoch = parseInt(msg, 10) || 0; renderUptime(); return; }
+  if (topic === 'hydroponics/uptime/connected') { connectedEpoch = parseInt(msg, 10) || 0; renderUptime(); return; }
+  if (/^hydroponics\/led[1-4]\/planted$/.test(topic)) {
+    const key = topic.split('/')[1];
+    if (/^\d{4}-\d{2}-\d{2}$/.test(msg)) plantDates[key] = msg; else delete plantDates[key];
+    renderPlantChips();
+    return;
+  }
+  if (topic === 'hydroponics/light_start/state') {
+    deviceLightStart = msg;
+    document.getElementById('lightStart').value = msg;
+    renderDeviceSched();
+    return;
+  }
+  if (topic === 'hydroponics/pump_schedule/state') {
+    const [on, off] = msg.split(',').map(n => parseInt(n, 10));
+    devicePumpOnMin = on; devicePumpOffMin = off;
+    document.getElementById('pOnSlider').value = on;
+    document.getElementById('pOffSlider').value = off;
+    updatePumpBar();
+    document.getElementById('pCurrentSched').textContent = `Device pump cycle: ${on}m on / ${off}m off`;
+    return;
+  }
+  if (topic === 'hydroponics/pump_cycle_status') {
+    lastPumpStatusAt = Date.now();
+    const [phase, elapsedSec, totalSec] = msg.split(',');
+    updatePumpRadial(phase, parseInt(elapsedSec, 10), parseInt(totalSec, 10));
+    return;
+  }
+  if (topic === 'hydroponics/cycle_status') {
+    lastLightStatusAt = Date.now();
+    const [phase, elapsedSec, totalSec] = msg.split(',');
+    updateRadial(phase, parseInt(elapsedSec,10), parseInt(totalSec,10));
+    return;
+  }
+  if (topic === 'hydroponics/manual_remaining') {
+    const sec = parseInt(msg, 10);
+    const m = Math.floor(sec / 60), s = sec % 60;
+    document.getElementById('manualBanner').textContent =
+      `Manual demo mode — reverts to automatic in ${m}:${String(s).padStart(2,'0')}`;
+    return;
+  }
+
+  const key = topic.split('/')[1];
+  const on = msg === '1';
+  state[key] = on;
+
+  if (key === 'pump') {
+    updatePumpButton();
+    updateFlow();
+  } else {
+    renderShelves();
+  }
+}
+
+// ================= Admin login / session =================
+const TOKEN_KEY = 'hydroAdminToken';
+let session = null;   // { token, user: {username, displayName} } while logged in
+function isAdmin() { return !!session; }
+function storeToken(t) { try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch (e) {} }
+function readToken() { try { return localStorage.getItem(TOKEN_KEY); } catch (e) { return null; } }
+
+async function apiFetch(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const token = session ? session.token : opts.token;
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const r = await fetch(API_BASE + path, { ...opts, headers, cache: 'no-store' });
+  let data = null;
+  try { data = await r.json(); } catch (e) {}
+  if (r.status === 401 && session && path !== '/auth/login') endSession('Your admin session expired — please log in again.');
+  return { ok: r.ok, status: r.status, data };
+}
+
+function applyAuthUI() {
+  const admin = isAdmin();
+  document.body.classList.toggle('preview', !admin);
+  document.getElementById('authBtn').textContent = admin ? 'Log out' : 'Admin login';
+  document.getElementById('userLabel').textContent = admin ? `Signed in as ${session.user.displayName}` : '';
+  // Preview: sliders stay visible (they show the device settings) but can't be moved
+  document.querySelectorAll('#schedulePanel input').forEach(r => { r.disabled = !admin; });
+  if (!admin) {
+    document.getElementById('adminPanel').classList.remove('open');
+    document.getElementById('logPanel').classList.remove('open');
+    if (!document.querySelector('.side-panel.open')) document.getElementById('overlay').classList.remove('open');
+  }
+  renderShelves();
+  updatePumpButton();
+}
+
+function startSession(token, user, mqttCreds) {
+  session = { token, user };
+  storeToken(token);
+  applyAuthUI();
+  connectMqtt(mqttCreds);
+}
+function endSession(message) {
+  session = null;
+  storeToken(null);
+  applyAuthUI();
+  connectMqtt(VIEWER_MQTT);
+  if (message) alert(message);
+}
+
+function authButton() { isAdmin() ? logout() : openLogin(); }
+function openLogin() {
+  document.getElementById('loginError').textContent = '';
+  document.getElementById('loginModal').classList.add('open');
+  setTimeout(() => document.getElementById('loginUser').focus(), 50);
+}
+function closeLogin() {
+  document.getElementById('loginModal').classList.remove('open');
+  document.getElementById('loginPass').value = '';
+}
+async function submitLogin() {
+  const btn = document.getElementById('loginSubmit');
+  const err = document.getElementById('loginError');
+  const username = document.getElementById('loginUser').value.trim();
+  const password = document.getElementById('loginPass').value;
+  if (!username || !password) { err.textContent = 'Enter your username and password.'; return; }
+  btn.disabled = true; btn.textContent = 'Logging in…'; err.textContent = '';
+  try {
+    const { ok, data } = await apiFetch('/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) });
+    if (!ok) { err.textContent = (data && data.error) || 'Login failed.'; return; }
+    closeLogin();
+    startSession(data.token, data.user, data.mqtt);
+  } catch (e) {
+    err.textContent = 'Could not reach the server. Check your connection.';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Log in';
+  }
+}
+async function logout() {
+  try { await apiFetch('/auth/logout', { method: 'POST' }); } catch (e) {}
+  endSession();
+}
+
+function sendHeartbeat() {
+  if (!isAdmin() || document.hidden) return;
+  apiFetch('/auth/heartbeat', { method: 'POST' }).catch(() => {});
+}
+setInterval(sendHeartbeat, 60 * 1000);
+
+// ---------- Admin panel ----------
+function fmtWhen(ts) {
+  if (!ts) return '—';
+  return ksaDay(ts) === ksaDay(Date.now()) ? `today ${ksaTime(ts)}` : `${ksaDate(ts)} ${ksaTime(ts)}`;
+}
+function fmtDuration(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+}
+function deviceOf(ua) {
+  ua = ua || '';
+  if (/iPhone|iPad/.test(ua)) return 'iPhone/iPad';
+  if (/Android/.test(ua)) return 'Android';
+  if (/Windows/.test(ua)) return 'Windows';
+  if (/Macintosh/.test(ua)) return 'Mac';
+  if (/Linux/.test(ua)) return 'Linux';
+  return 'Unknown device';
+}
+async function loadAdminOverview() {
+  if (!isAdmin()) return;
+  const online = document.getElementById('adminOnline');
+  online.innerHTML = '<div class="admin-row muted">Loading…</div>';
+  try {
+    const { ok, data } = await apiFetch('/admin/overview');
+    if (!ok) { online.innerHTML = `<div class="admin-row">${escapeHtml((data && data.error) || 'Could not load')}</div>`; return; }
+    const now = data.now;
+    online.innerHTML = data.online.length
+      ? data.online.map(o => `<div class="admin-row"><span class="dot"></span><b>${escapeHtml(o.name)}</b>
+          · ${deviceOf(o.user_agent)}<br><span class="muted">logged in ${fmtWhen(o.created_at)}</span></div>`).join('')
+      : '<div class="admin-row muted">Nobody online</div>';
+    document.getElementById('adminActions').innerHTML = data.actions.length
+      ? data.actions.map(a => `<div class="admin-row"><span class="muted">${fmtWhen(a.ts)}</span><br>
+          <b>${escapeHtml(a.name)}</b>: ${escapeHtml(a.action)}</div>`).join('')
+      : '<div class="admin-row muted">No actions yet</div>';
+    document.getElementById('adminLogins').innerHTML = data.logins.length
+      ? data.logins.map(l => {
+          const isOnline = !l.ended_at && l.expires_at > now && l.last_seen > now - data.onlineWindowMs;
+          const status = isOnline ? '<span class="dot"></span>online now'
+            : l.ended_at ? `logged out ${fmtWhen(l.ended_at)} (${fmtDuration(l.ended_at - l.created_at)})`
+            : `last seen ${fmtWhen(l.last_seen)}`;
+          return `<div class="admin-row"><b>${escapeHtml(l.name)}</b> · ${deviceOf(l.user_agent)}<br>
+            <span class="muted">in ${fmtWhen(l.created_at)}</span> — ${status}</div>`;
+        }).join('')
+      : '<div class="admin-row muted">No logins yet</div>';
+  } catch (e) {
+    online.innerHTML = '<div class="admin-row">Could not reach the server.</div>';
+  }
+}
+
+// ---------- Start-up: restore a saved admin login, otherwise preview ----------
+async function initAuth() {
+  const token = readToken();
+  if (token) {
+    try {
+      const { ok, data } = await apiFetch('/auth/me', { token });
+      if (ok && data.mqtt) { startSession(token, data.user, data.mqtt); return; }
+      storeToken(null);
+    } catch (e) { /* server unreachable: fall back to preview */ }
+  }
+  applyAuthUI();
+  connectMqtt(VIEWER_MQTT);
+}
+
+renderShelves();
+renderLogs();
+loadLogHistory();
+updateStatusDisplay();
+updateCycleBar(8);
+updatePumpBar();
+updateKsaClock();
+initAuth();
+</script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# Real credentials: never commit
+firmware/**/secrets.h
+secrets.h
+
+# Arduino build output / exported binaries
+build/
+*.bin
+*.elf
+*.map
+
+# Cloudflare / Node
+.wrangler/
+node_modules/
+.dev.vars
+
+# OS clutter
+.DS_Store
+Thumbs.db

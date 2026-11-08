@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<!--
+  =====================================================================================
+  Lamba Smart Hydroponics: admin account setup (admin-setup.html)
+  =====================================================================================
+  A form only; it stores nothing itself. It sends the setup key and account details to
+  the Worker (POST /auth/setup), which hashes the password and saves it in D1.
+  Protected by the Worker secret SETUP_KEY: without it nothing can be created.
+
+  Create / update: username + display name + password (8+ chars). Updating an existing
+    username resets its password and signs that admin out everywhere.
+  Delete: username + the Delete button.
+
+  SETTING TO CHANGE: API_BASE (Cloudflare Worker URL, no trailing slash).
+  Must be uploaded together with index.html (every upload replaces the whole site).
+  =====================================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hydroponics — Admin account setup</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; font-family: system-ui, sans-serif; color: #16261f;
+    background: linear-gradient(160deg, #12503f 0%, #1d8a68 45%, #3fb98a 100%);
+    display: flex; flex-direction: column; align-items: center; padding: 28px 16px; }
+  img { height: 56px; margin-bottom: 14px; }
+  .card { background: #fff; border-radius: 14px; padding: 22px 20px; width: 100%; max-width: 380px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+  h1 { font-size: 1.1rem; margin: 0 0 4px; }
+  p.note { font-size: .8rem; color: #666; margin: 0 0 16px; line-height: 1.45; }
+  label { display: block; font-size: .78rem; font-weight: 600; margin: 10px 0 4px; }
+  input { width: 100%; padding: 9px 11px; border: 1px solid #ccd6d0; border-radius: 8px; font-size: .95rem; }
+  .row { display: flex; gap: 8px; margin-top: 16px; }
+  button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-weight: 700; cursor: pointer; color: #fff;
+    background: linear-gradient(90deg, #6a6ee0, #e05a7a); }
+  button.danger { flex: 0 0 auto; background: #fff; color: #c0392b; border: 1px solid #e3b5ae; }
+  .back { display: block; text-align: center; margin-top: 16px; font-size: .85rem; color: #fff;
+    font-weight: 600; text-decoration: none; }
+  .back:hover { text-decoration: underline; }
+  #result { margin-top: 14px; font-size: .85rem; text-align: center; min-height: 20px; }
+  .ok { color: #2e7d46; } .err { color: #c0392b; }
+</style>
+</head>
+<body>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB2aWV3Qm94PSIwIDAgMTU2LjcyIDkzLjY3Ij48ZGVmcz48Y2xpcFBhdGggaWQ9ImNsaXAtMCI+PHBhdGggY2xpcC1ydWxlPSJub256ZXJvIiBkPSJNIDAuMTMgMCBMIDE1NSAwIEwgMTU1IDQ4IEwgMC4xMyA0OCBaIE0gMC4xMyAwICIvPjwvY2xpcFBhdGg+PGNsaXBQYXRoIGlkPSJjbGlwLTEiPjxwYXRoIGNsaXAtcnVsZT0ibm9uemVybyIgZD0iTSA0OSA2NSBMIDkxIDY1IEwgOTEgOTMuMzUgTCA0OSA5My4zNSBaIE0gNDkgNjUgIi8+PC9jbGlwUGF0aD48Y2xpcFBhdGggaWQ9ImNsaXAtMiI+PHBhdGggY2xpcC1ydWxlPSJub256ZXJvIiBkPSJNIDUgNTMgTCAxMyA1MyBMIDEzIDkzLjM1IEwgNSA5My4zNSBaIE0gNSA1MyAiLz48L2NsaXBQYXRoPjxjbGlwUGF0aCBpZD0iY2xpcC0zIj48cGF0aCBjbGlwLXJ1bGU9Im5vbnplcm8iIGQ9Ik0gOTMgNTIgTCAxMjQgNTIgTCAxMjQgOTMuMzUgTCA5MyA5My4zNSBaIE0gOTMgNTIgIi8+PC9jbGlwUGF0aD48Y2xpcFBhdGggaWQ9ImNsaXAtNCI+PHBhdGggY2xpcC1ydWxlPSJub256ZXJvIiBkPSJNIDE2IDY1IEwgNDYgNjUgTCA0NiA5My4zNSBMIDE2IDkzLjM1IFogTSAxNiA2NSAiLz48L2NsaXBQYXRoPjxjbGlwUGF0aCBpZD0iY2xpcC01Ij48cGF0aCBjbGlwLXJ1bGU9Im5vbnplcm8iIGQ9Ik0gMTI2IDY1IEwgMTU2LjMxIDY1IEwgMTU2LjMxIDkzLjM1IEwgMTI2IDkzLjM1IFogTSAxMjYgNjUgIi8+PC9jbGlwUGF0aD48L2RlZnM+PGcgY2xpcC1wYXRoPSJ1cmwoI2NsaXAtMCkiPjxwYXRoIGZpbGwtcnVsZT0ibm9uemVybyIgZmlsbD0icmdiKDEwMCUsIDEwMCUsIDEwMCUpIiBmaWxsLW9wYWNpdHk9IjEiIGQ9Ik0gMTMzLjI3IDM0LjY0IEMgMTMzLjAxIDM2LjkwIDEzMS44NCAzOC44OSAxMzAuMTUgNDAuMjQgTCAxMzAuMTUgNDAuMjQgQyAxMjguNzIgNDEuMzggMTI2LjkwIDQyLjA3IDEyNC45MyA0Mi4wNyBDIDEyMi45NiA0Mi4wNyAxMjEuMTUgNDEuMzggMTE5LjcyIDQwLjI0IEMgMTE4LjAzIDM4Ljg5IDExNi44NiAzNi45MSAxMTYuNjAgMzQuNjYgQyAxMTYuNTYgMzQuMzMgMTE2LjU0IDM0LjAwIDExNi41NCAzMy42NyBDIDExNi41NCAzMy41NyAxMTYuNTQgMzMuNDYgMTE2LjU1IDMzLjM2IEMgMTE2LjcxIDI4Ljg3IDEyMC40MSAyNS4yOCAxMjQuOTMgMjUuMjggQyAxMjkuNDYgMjUuMjggMTMzLjE2IDI4Ljg3IDEzMy4zMiAzMy4zNiBDIDEzMy4zMiAzMy40NiAxMzMuMzMgMzMuNTcgMTMzLjMzIDMzLjY3IEMgMTMzLjMzIDM0LjAwIDEzMy4zMSAzNC4zMiAxMzMuMjcgMzQuNjQgTSAxNC4xMiAzNS4yNyBDIDkuNDkgMzUuMjcgNS43MyAzMS41MSA1LjczIDI2Ljg4IEMgNS43MyAyMi4yNSA5LjQ5IDE4LjQ4IDE0LjEyIDE4LjQ4IEMgMTguNzUgMTguNDggMjIuNTQgMjIuMjUgMjIuNTQgMjYuODggQyAyMi41NCAzMS41MSAxOC43NSAzNS4yNyAxNC4xMiAzNS4yNyBNIDEzNy4yOCA0MC4yNCBDIDEzNy4yOCA0MC4yNCAxMzcuMjggNDAuMjQgMTM3LjI4IDQwLjI0IEwgMTU0LjA1IDQwLjI0IEMgMTU0LjIxIDQwLjI0IDE1NC4zMyA0MC4xMSAxNTQuMzMgMzkuOTYgTCAxNTQuMzMgNi4zNyBDIDE1NC4zMyA0LjI5IDE1My40NCAyLjMxIDE1MS44NyAwLjk1IEwgMTUwLjg2IDAuMDcgQyAxNTAuNzQgLTAuMDMgMTUwLjU1IC0wLjAxIDE1MC40NSAwLjA5IEwgMTQ3LjEyIDMuOTIgQyAxNDcuMDIgNC4wNSAxNDcuMDMgNC4yMyAxNDcuMTUgNC4zMyBMIDE0OC4xNyA1LjIyIEMgMTQ4LjUwIDUuNTEgMTQ4LjY3IDUuOTMgMTQ4LjY3IDYuMzcgTCAxNDguNjcgMzQuNjQgTCAxMzguODkgMzQuNjQgQyAxMzguOTEgMzQuMzIgMTM4LjkyIDM0LjAwIDEzOC45MiAzMy42NyBDIDEzOC45MiAzMy41NyAxMzguOTIgMzMuNDYgMTM4LjkyIDMzLjM2IEMgMTM4Ljc1IDI1Ljc5IDEzMi41NSAxOS42OCAxMjQuOTMgMTkuNjggQyAxMTcuMzIgMTkuNjggMTExLjExIDI1Ljc5IDExMC45NSAzMy4zNiBDIDExMC45NSAzMy40NiAxMTAuOTQgMzMuNTcgMTEwLjk0IDMzLjY3IEMgMTEwLjk0IDM0LjAwIDExMC45NiAzNC4zMyAxMTAuOTggMzQuNjYgTCAxMDAuNzkgMzQuNjYgTCAxMDAuNzkgMTMuNjQgQyAxMDAuNzkgMTMuNDggMTAwLjY2IDEzLjM1IDEwMC41MCAxMy4zNSBMIDk1LjQ3IDEzLjM1IEMgOTUuMzAgMTMuMzUgOTUuMTcgMTMuNDggOTUuMTcgMTMuNjQgTCA5NS4xNyAzNC42NiBMIDI4LjEwIDM0LjY2IEwgMjguMTAgMTMuNTcgQyAyOC4xMCAxMy40NSAyOC4wNCAxMy4zNSAyNy45MiAxMy4zNSBMIDIyLjc2IDEzLjM1IEMgMjIuNjQgMTMuMzUgMjIuNTQgMTMuNDUgMjIuNTQgMTMuNTcgTCAyMi41NCAxNS43MSBDIDIwLjE5IDEzLjk0IDE3LjI4IDEyLjg5IDE0LjEyIDEyLjg5IEMgNi40MSAxMi44OSAwLjEzIDE5LjE2IDAuMTMgMjYuODggQyAwLjEzIDM0LjU5IDYuNDEgNDAuODcgMTQuMTIgNDAuODcgQyAxNy42MSA0MC44NyAyMC44MyAzOS41NyAyMy4yOCAzNy40NCBDIDIzLjI4IDM3LjQ0IDIzLjI4IDM3LjQ1IDIzLjI4IDM3LjQ1IEwgMjMuMjggMzcuNDUgQyAyNC4yMyAzOS4wOCAyNS45OCA0MC4xOSAyOC4wMCA0MC4yNCBDIDI4LjAwIDQwLjI0IDI4LjAxIDQwLjI0IDI4LjAxIDQwLjI0IEwgMjguMTAgNDAuMjQgTCAyOC4xMCA0MC4yNCBMIDI4LjEwIDQwLjI0IEwgMTEyLjU4IDQwLjI0IEwgOTUuMTcgNDAuMjQgTCAxMTIuNTggNDAuMjQgQyAxMTQuOTQgNDQuNjUgMTE5LjU5IDQ3LjY2IDEyNC45MyA0Ny42NiBDIDEzMC4yOCA0Ny42NiAxMzQuOTIgNDQuNjUgMTM3LjI4IDQwLjI0ICIvPjwvZz48ZyBjbGlwLXBhdGg9InVybCgjY2xpcC0xKSI+PHBhdGggZmlsbC1ydWxlPSJub256ZXJvIiBmaWxsPSJyZ2IoMTAwJSwgMTAwJSwgMTAwJSkiIGZpbGwtb3BhY2l0eT0iMSIgZD0iTSA4OS40MiA4OC4xMiBDIDg5LjA4IDg3LjgzIDg4LjkxIDg3LjQyIDg4LjkxIDg2Ljk4IEwgODguOTEgNzYuMjEgTCA4OC45MSA3Ni4yMSBDIDg4LjkxIDcwLjE5IDg0LjAxIDY1LjI5IDc3Ljk5IDY1LjI5IEMgNzQuNzYgNjUuMjkgNzEuODcgNjYuNzEgNjkuODcgNjguOTQgQyA2Ny44NiA2Ni43MSA2NC45NyA2NS4yOSA2MS43NCA2NS4yOSBDIDU5LjI3IDY1LjI5IDU2Ljk5IDY2LjEyIDU1LjE2IDY3LjUxIEMgNTQuODIgNjcuMDEgNTQuNDIgNjYuNTcgNTMuOTYgNjYuMTcgTCA1Mi45NCA2NS4yOCBDIDUyLjgyIDY1LjE4IDUyLjY0IDY1LjE5IDUyLjUzIDY1LjMxIEwgNDkuMjEgNjkuMTQgQyA0OS4xMCA2OS4yNiA0OS4xMiA2OS40NSA0OS4yNCA2OS41NSBMIDUwLjI2IDcwLjQ0IEMgNTAuNTkgNzAuNzMgNTAuNzggNzEuMTQgNTAuNzggNzEuNTkgTCA1MC43OCA5Mi4zNCBDIDUwLjc4IDkyLjUwIDUwLjg5IDkyLjYyIDUxLjA1IDkyLjYyIEwgNTYuMTQgOTIuNjIgQyA1Ni4zMCA5Mi42MiA1Ni40NCA5Mi41MCA1Ni40NCA5Mi4zNCBMIDU2LjQ0IDc1Ljc5IEMgNTYuNjUgNzMuMDUgNTguOTUgNzAuODkgNjEuNzQgNzAuODkgQyA2NC42OCA3MC44OSA2Ny4wNyA3My4yOCA2Ny4wNyA3Ni4yMSBMIDY3LjA3IDc2LjIxIEwgNjcuMDcgOTIuMzAgQyA2Ny4wNyA5Mi40NiA2Ny4xOSA5Mi41OCA2Ny4zNSA5Mi41OCBMIDcyLjM4IDkyLjU4IEMgNzIuNTQgOTIuNTggNzIuNjYgOTIuNDYgNzIuNjYgOTIuMzAgTCA3Mi42NiA3Ni4yMSBDIDcyLjY2IDczLjI4IDc1LjA1IDcwLjg5IDc3Ljk5IDcwLjg5IEMgODAuOTMgNzAuODkgODMuMzIgNzMuMjggODMuMzIgNzYuMjEgTCA4My4zMiA4Ni45OCBDIDgzLjMyIDg5LjA0IDg0LjE5IDkxIDg1Ljc1IDkyLjM1IEwgODYuNzUgOTMuMjIgQyA4Ni44NyA5My4zMiA4Ny4wNiA5My4zMSA4Ny4xNiA5My4xOSBMIDkwLjQ1IDg5LjQwIEMgOTAuNTUgODkuMjggOTAuNTQgODkuMTAgOTAuNDIgODguOTkgWiBNIDg5LjQyIDg4LjEyICIvPjwvZz48ZyBjbGlwLXBhdGg9InVybCgjY2xpcC0yKSI+PHBhdGggZmlsbC1ydWxlPSJub256ZXJvIiBmaWxsPSJyZ2IoMTAwJSwgMTAwJSwgMTAwJSkiIGZpbGwtb3BhY2l0eT0iMSIgZD0iTSAxMS44NiA4OC4wOCBDIDExLjUyIDg3Ljc5IDExLjI4IDg3LjM3IDExLjI4IDg2LjkyIEwgMTEuMjggNTMuMzggQyAxMS4yOCA1My4yMiAxMS4xNSA1My4wOSAxMC45OSA1My4wOSBMIDUuOTEgNTMuMDkgQyA1Ljc1IDUzLjA5IDUuNjIgNTMuMjIgNS42MiA1My4zOCBMIDUuNjIgODYuODEgQyA1LjYyIDg4LjkzIDYuNTUgOTAuOTYgOC4xNSA5Mi4zNSBMIDkuMTMgOTMuMjAgQyA5LjI3IDkzLjMyIDkuNDkgOTMuMzEgOS42MSA5My4xNyBMIDEyLjg3IDg5LjQxIEMgMTMgODkuMjcgMTIuOTggODkuMDUgMTIuODMgODguOTMgWiBNIDExLjg2IDg4LjA4ICIvPjwvZz48cGF0aCBmaWxsLXJ1bGU9Im5vbnplcm8iIGZpbGw9InJnYigxMDAlLCAxMDAlLCAxMDAlKSIgZmlsbC1vcGFjaXR5PSIxIiBkPSJNIDgwLjgzIDUxLjE1IEMgODAuODMgNDkuMzkgNzkuNDEgNDcuOTcgNzcuNjUgNDcuOTcgQyA3NS45MCA0Ny45NyA3NC40OCA0OS4zOSA3NC40OCA1MS4xNSBDIDc0LjQ4IDUyLjkxIDc1LjkwIDU0LjMzIDc3LjY1IDU0LjMzIEMgNzkuNDEgNTQuMzMgODAuODMgNTIuOTEgODAuODMgNTEuMTUgIi8+PHBhdGggZmlsbC1ydWxlPSJub256ZXJvIiBmaWxsPSJyZ2IoMTAwJSwgMTAwJSwgMTAwJSkiIGZpbGwtb3BhY2l0eT0iMSIgZD0iTSAxOC43OSA3LjgyIEMgMjAuNTQgNy44MiAyMS45NyA2LjQwIDIxLjk3IDQuNjQgQyAyMS45NyAyLjg5IDIwLjU0IDEuNDYgMTguNzkgMS40NiBDIDE3LjAzIDEuNDYgMTUuNjEgMi44OSAxNS42MSA0LjY0IEMgMTUuNjEgNi40MCAxNy4wMyA3LjgyIDE4Ljc5IDcuODIgIi8+PHBhdGggZmlsbC1ydWxlPSJub256ZXJvIiBmaWxsPSJyZ2IoMTAwJSwgMTAwJSwgMTAwJSkiIGZpbGwtb3BhY2l0eT0iMSIgZD0iTSA5LjQ0IDcuODIgQyAxMS4yMCA3LjgyIDEyLjYyIDYuNDAgMTIuNjIgNC42NCBDIDEyLjYyIDIuODkgMTEuMjAgMS40NiA5LjQ0IDEuNDYgQyA3LjY5IDEuNDYgNi4yNiAyLjg5IDYuMjYgNC42NCBDIDYuMjYgNi40MCA3LjY5IDcuODIgOS40NCA3LjgyICIvPjxnIGNsaXAtcGF0aD0idXJsKCNjbGlwLTMpIj48cGF0aCBmaWxsLXJ1bGU9Im5vbnplcm8iIGZpbGw9InJnYigxMDAlLCAxMDAlLCAxMDAlKSIgZmlsbC1vcGFjaXR5PSIxIiBkPSJNIDEwOS42MSA4Ny43MSBDIDEwNS4yNyA4Ny43MSAxMDEuNjkgODQuNDAgMTAxLjI2IDgwLjE3IEwgMTAxLjI2IDc4LjQ2IEMgMTAxLjY5IDc0LjIzIDEwNS4yNyA3MC45MiAxMDkuNjEgNzAuOTIgQyAxMTQuMjQgNzAuOTIgMTE4LjAxIDc0LjY5IDExOC4wMSA3OS4zMiBDIDExOC4wMSA4My45NSAxMTQuMjQgODcuNzEgMTA5LjYxIDg3LjcxIE0gMTA5LjYxIDY1LjMzIEMgMTA2LjQ4IDY1LjMzIDEwMy41OSA2Ni4zNiAxMDEuMjYgNjguMTAgQyAxMDEuMjYgNjguMTAgMTAxLjI2IDY4LjEwIDEwMS4yNiA2OC4xMCBDIDEwMS4yNiA2OC4xMCAxMDEuMjYgNjguMTAgMTAxLjI2IDY4LjEwIEwgMTAxLjI2IDU4Ljc3IEMgMTAxLjI2IDU2LjY5IDEwMC4zMCA1NC43MiA5OC43MyA1My4zNSBMIDk3LjcxIDUyLjQ3IEMgOTcuNTkgNTIuMzcgOTcuNDEgNTIuMzggOTcuMzAgNTIuNTAgTCA5My45OCA1Ni4zMyBDIDkzLjg3IDU2LjQ1IDkzLjg5IDU2LjY0IDk0LjAxIDU2Ljc0IEwgOTUuMDMgNTcuNjIgQyA5NS4zNiA1Ny45MSA5NS42MSA1OC4zMyA5NS42MSA1OC43OCBMIDk1LjYxIDkyLjM0IEMgOTUuNjEgOTIuNTAgOTUuNzMgOTIuNjIgOTUuODkgOTIuNjIgTCAxMDAuOTggOTIuNjIgQyAxMDEuMTQgOTIuNjIgMTAxLjI2IDkyLjUwIDEwMS4yNiA5Mi4zNCBMIDEwMS4yNiA5MC41MyBMIDEwMS4yNiA5MC41NCBDIDEwMy41OSA5Mi4yOCAxMDYuNDggOTMuMzEgMTA5LjYxIDkzLjMxIEMgMTE3LjMzIDkzLjMxIDEyMy42MCA4Ny4wMyAxMjMuNjAgNzkuMzIgQyAxMjMuNjAgNzEuNjAgMTE3LjMzIDY1LjMzIDEwOS42MSA2NS4zMyAiLz48L2c+PGcgY2xpcC1wYXRoPSJ1cmwoI2NsaXAtNCkiPjxwYXRoIGZpbGwtcnVsZT0ibm9uemVybyIgZmlsbD0icmdiKDEwMCUsIDEwMCUsIDEwMCUpIiBmaWxsLW9wYWNpdHk9IjEiIGQ9Ik0gMzguNDcgODAuNTggQyAzNy44OCA4NC42MyAzNC4zOCA4Ny43NSAzMC4xNyA4Ny43NSBDIDI1LjU0IDg3Ljc1IDIxLjc3IDgzLjk4IDIxLjc3IDc5LjM1IEMgMjEuNzcgNzQuNzMgMjUuNTQgNzAuOTYgMzAuMTcgNzAuOTYgQyAzNC4zOCA3MC45NiAzNy44OCA3NC4wOCAzOC40NyA3OC4xNCBaIE0gNDQuNzEgODguMTIgQyA0NC4zNyA4Ny44MyA0NC4xMiA4Ny40MiA0NC4xMiA4Ni45NyBMIDQ0LjEyIDY2LjIzIEMgNDQuMTIgNjYuMDggNDQgNjUuOTUgNDMuODQgNjUuOTUgTCAzOC43NSA2NS45NSBDIDM4LjYwIDY1Ljk1IDM4LjQ3IDY2LjA4IDM4LjQ3IDY2LjIzIEwgMzguNDcgNjguMTEgQyAzNi4xNSA2Ni4zOSAzMy4yOCA2NS4zNiAzMC4xNyA2NS4zNiBDIDIyLjQ1IDY1LjM2IDE2LjE3IDcxLjY0IDE2LjE3IDc5LjM1IEMgMTYuMTcgODcuMDcgMjIuNDUgOTMuMzUgMzAuMTcgOTMuMzUgQyAzMy42MSA5My4zNSAzNi43NiA5Mi4wOSAzOS4xOSA5MC4wMiBDIDM5LjYyIDkwLjkyIDQwLjIzIDkxLjczIDQxLjAwIDkyLjM5IEwgNDEuOTggOTMuMjQgQyA0Mi4xMiA5My4zNyA0Mi4zMyA5My4zNSA0Mi40NiA5My4yMSBMIDQ1LjcyIDg5LjQ2IEMgNDUuODQgODkuMzEgNDUuODMgODkuMTAgNDUuNjggODguOTggWiBNIDQ0LjcxIDg4LjEyICIvPjwvZz48ZyBjbGlwLXBhdGg9InVybCgjY2xpcC01KSI+PHBhdGggZmlsbC1ydWxlPSJub256ZXJvIiBmaWxsPSJyZ2IoMTAwJSwgMTAwJSwgMTAwJSkiIGZpbGwtb3BhY2l0eT0iMSIgZD0iTSAxNDguOTggODAuNTggQyAxNDguMzkgODQuNjMgMTQ0Ljg5IDg3Ljc1IDE0MC42NyA4Ny43NSBDIDEzNi4wNSA4Ny43NSAxMzIuMjggODMuOTggMTMyLjI4IDc5LjM1IEMgMTMyLjI4IDc0LjczIDEzNi4wNSA3MC45NiAxNDAuNjcgNzAuOTYgQyAxNDQuODkgNzAuOTYgMTQ4LjM5IDc0LjA4IDE0OC45OCA3OC4xNCBaIE0gMTU2LjE5IDg4Ljk4IEwgMTU1LjIxIDg4LjEyIEMgMTU0Ljg4IDg3LjgzIDE1NC42MyA4Ny40MiAxNTQuNjMgODYuOTcgTCAxNTQuNjMgNjYuMjMgQyAxNTQuNjMgNjYuMDggMTU0LjUxIDY1Ljk1IDE1NC4zNSA2NS45NSBMIDE0OS4yNiA2NS45NSBDIDE0OS4xMCA2NS45NSAxNDguOTggNjYuMDggMTQ4Ljk4IDY2LjIzIEwgMTQ4Ljk4IDY4LjExIEMgMTQ2LjY2IDY2LjM5IDE0My43OSA2NS4zNiAxNDAuNjcgNjUuMzYgQyAxMzIuOTYgNjUuMzYgMTI2LjY4IDcxLjY0IDEyNi42OCA3OS4zNSBDIDEyNi42OCA4Ny4wNyAxMzIuOTYgOTMuMzUgMTQwLjY3IDkzLjM1IEMgMTQ0LjEyIDkzLjM1IDE0Ny4yNyA5Mi4wOSAxNDkuNzAgOTAuMDIgQyAxNTAuMTMgOTAuOTIgMTUwLjc0IDkxLjczIDE1MS41MSA5Mi4zOSBMIDE1Mi40OSA5My4yNCBDIDE1Mi42MyA5My4zNyAxNTIuODUgOTMuMzUgMTUyLjk3IDkzLjIxIEwgMTU2LjIzIDg5LjQ2IEMgMTU2LjM1IDg5LjMxIDE1Ni4zMyA4OS4xMCAxNTYuMTkgODguOTggIi8+PC9nPjwvc3ZnPg==" alt="Lamba">
+<div class="card">
+  <h1>Admin account setup</h1>
+  <p class="note">Creates an admin account, or resets the password of an existing one (which also signs
+    it out everywhere). You need the <b>SETUP_KEY</b> secret you set on the Worker.
+    Without the setup key, nobody can create an account.</p>
+
+  <label>Setup key</label>
+  <input id="setupKey" type="password" autocomplete="off">
+  <label>Username (used to log in)</label>
+  <input id="username" autocapitalize="none" autocomplete="off" placeholder="e.g. admin">
+  <label>Display name (shown in the activity log)</label>
+  <input id="displayName" placeholder="e.g. Admin">
+  <label>Password (8+ characters)</label>
+  <input id="password" type="password" autocomplete="new-password">
+  <label>Confirm password</label>
+  <input id="password2" type="password" autocomplete="new-password">
+
+  <div class="row">
+    <button onclick="save()">Create / update account</button>
+    <button class="danger" onclick="del()">Delete</button>
+  </div>
+  <div id="result"></div>
+</div>
+<a class="back" href="index.html">← Back to dashboard</a>
+<script>
+const API_BASE = "https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev";
+const $ = id => document.getElementById(id);
+function show(msg, ok) { $('result').textContent = msg; $('result').className = ok ? 'ok' : 'err'; }
+async function post(body) {
+  try {
+    const r = await fetch(API_BASE + '/auth/setup', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await r.json().catch(() => ({}));
+    r.ok ? show(data.message || 'Done', true) : show(data.error || ('Error ' + r.status), false);
+    return r.ok;
+  } catch (e) { show('Could not reach the Worker. Check your connection.', false); return false; }
+}
+async function save() {
+  if ($('password').value !== $('password2').value) return show('Passwords do not match', false);
+  const ok = await post({ setupKey: $('setupKey').value, username: $('username').value,
+    displayName: $('displayName').value, password: $('password').value });
+  if (ok) { $('password').value = ''; $('password2').value = ''; }
+}
+async function del() {
+  const u = $('username').value.trim();
+  if (!u) return show('Enter the username to delete', false);
+  if (!confirm('Delete admin account "' + u + '"?')) return;
+  post({ setupKey: $('setupKey').value, username: u, delete: true });
+}
+</script>
+</body>
+</html>
