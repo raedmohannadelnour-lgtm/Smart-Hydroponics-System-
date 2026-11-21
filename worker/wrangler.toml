@@ -1,0 +1,26 @@
+# Deploy with:  npx wrangler deploy   (run inside this worker/ folder)
+# Secrets are NOT stored here. Set them with:  npx wrangler secret put <NAME>
+#   LOG_KEY, SETUP_KEY, DEVICE_KEY
+name = "hydro-api"
+main = "hydro-log-worker.js"
+compatibility_date = "2025-01-01"
+
+# Live relay that replaces the MQTT broker
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "HydroRelay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["HydroRelay"]   # SQLite-backed Durable Object (works on the free plan)
+
+# Event log + firmware files
+[[kv_namespaces]]
+binding = "LOGS"
+id = "YOUR-KV-NAMESPACE-ID"
+
+# Admin accounts, sessions, audit trail
+[[d1_databases]]
+binding = "DB"
+database_name = "hydro-db"
+database_id = "YOUR-D1-DATABASE-ID"

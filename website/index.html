@@ -7,25 +7,23 @@
   admin-setup.html. Full system guide: "Lamba Smart Hydroponics - System Guide".
 
   MODES
-    Preview (default, anyone with the link): connects to HiveMQ with the public
-      subscribe-only login (VIEWER_MQTT). Everything is visible, nothing can be changed.
+    Preview (default, anyone with the link): connects to the live relay (a Cloudflare
+      Durable Object) as a read-only viewer. Everything is visible, nothing can be changed.
       Log + Admin tabs and the connection status are hidden.
     Admin (after "Admin login"): the Worker checks the password and returns the
-      full-control HiveMQ login, which is never stored in this file. Commands go through
+      a session token; the page sends it over the WebSocket to unlock commands. Commands go through
       sendCommand(), which also records who did what (POST /audit).
 
   SETTINGS TO CHANGE (top of the script section below)
-    BROKER_URL   HiveMQ cluster WebSocket address  wss://<cluster-host>:8884/mqtt
-    VIEWER_MQTT  public subscribe-only login        (username is case-sensitive)
     API_BASE     Cloudflare Worker URL              (no trailing slash)
 
   SCRIPT LAYOUT (in order)
     settings -> shelf rendering + planting-date tags -> log panel -> KSA time helpers
     -> schedule tab (gauges, switch times, sliders, save/reset) -> uptime box
-    -> MQTT connection + message handler (onMqttMessage) -> admin login/session
+    -> relay connection (relayConnect) + message handler (onMqttMessage) -> admin login/session
     -> admin panel -> start-up (initAuth)
 
-  MQTT topics are listed in the System Guide (Code reference -> MQTT topics).
+  Topics (MQTT-style names, e.g. hydroponics/led1/state) are listed in docs/SETUP.md.
   All times are shown in KSA (Asia/Riyadh), 12-hour format.
   =====================================================================================
 -->
@@ -37,7 +35,6 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<script src="https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js"></script>
 <style>
   :root {
     box-sizing: border-box;
@@ -512,18 +509,66 @@
 
 <script>
 // =============================== SETTINGS ===============================
-// ---------- HiveMQ Cloud connection ----------
-const BROKER_URL = "wss://YOUR-CLUSTER.s1.eu.hivemq.cloud:8884/mqtt";
-// Public, SUBSCRIBE-ONLY credential for preview mode. It's fine that this is visible in
-// the page source: HiveMQ refuses any command sent with it.
-// Admins get the full-control credential from the Worker after logging in.
-const VIEWER_MQTT = { username: "YOUR-VIEWER-USER", password: "YOUR-VIEWER-PASSWORD" };
-// --------------------------------------------
-
-// ---------- Cloudflare Worker (log + admin login) ----------
+// ---------- Cloudflare Worker (live relay + log + admin login) ----------
+// The only setting. No passwords live in this page: viewers connect read-only, and
+// admins unlock commands with their login token.
 const API_BASE = "https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev";
 const LOG_API  = API_BASE + "/logs";
-// -----------------------------------------------------------
+const RELAY_URL = API_BASE.replace(/^http/, 'ws') + "/ws";
+const VIEWER = null;   // "credentials" for preview mode: none
+// ------------------------------------------------------------------------
+
+// ---------- Relay client ----------
+// A small stand-in for mqtt.js, talking to the Durable Object relay with JSON frames.
+// It keeps the same shape (on / subscribe / publish / connected / reconnecting / end),
+// so the rest of the page is unchanged. Reconnects every 2 s and re-subscribes.
+function relayConnect(url, token) {
+  const handlers = {};
+  const subs = new Set();
+  let ws = null, closedByUs = false, timer = null;
+  const c = {
+    connected: false, reconnecting: false, stream: null,
+    on(ev, fn) { (handlers[ev] = handlers[ev] || []).push(fn); return c; },
+    removeAllListeners() { for (const k in handlers) delete handlers[k]; },
+    subscribe(topic) {
+      subs.add(topic);
+      if (c.connected) ws.send(JSON.stringify({ t: 'sub', topic }));
+    },
+    publish(topic, payload, opts) {
+      if (!c.connected) return;
+      ws.send(JSON.stringify({ t: 'pub', topic, payload: String(payload), retain: !!(opts && opts.retain) }));
+    },
+    end() { closedByUs = true; clearTimeout(timer); if (ws) ws.close(); },
+    reconnect() { if (!closedByUs && !c.connected) { clearTimeout(timer); open(); } },
+  };
+  const emit = (ev, ...a) => (handlers[ev] || []).forEach(fn => fn(...a));
+  function ready() {
+    c.connected = true; c.reconnecting = false;
+    subs.forEach(topic => ws.send(JSON.stringify({ t: 'sub', topic })));
+    emit('connect');
+  }
+  function open() {
+    ws = new WebSocket(url);
+    c.stream = { destroy: () => ws.close() };
+    ws.onopen = () => token ? ws.send(JSON.stringify({ t: 'auth', token })) : ready();
+    ws.onmessage = ev => {
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.t === 'auth_ok') ready();
+      else if (m.t === 'auth_err') { emit('error', new Error('Not authorized')); ready(); }   // stays read-only
+      else if (m.t === 'msg') emit('message', m.topic, String(m.payload));
+    };
+    ws.onerror = () => emit('error', new Error('Relay connection error'));
+    ws.onclose = () => {
+      const was = c.connected; c.connected = false;
+      if (was) emit('close');
+      if (closedByUs) return;
+      c.reconnecting = true; emit('reconnect');
+      timer = setTimeout(open, 2000);
+    };
+  }
+  open();
+  return c;
+}
 
 // Shelf 1 = bottom shelf ... Shelf 4 = top shelf. Listed here top-to-bottom, the order
 // they appear on the page (so it matches the real rack).
@@ -1125,16 +1170,11 @@ function updateStatusDisplay() {
 
 let client = null;
 let everConnected = false;
-function connectMqtt(creds) {
+// token = admin login token, or VIEWER (null) for read-only preview
+function connectMqtt(token) {
   if (client) { client.removeAllListeners(); client.end(true); }
   brokerConnected = false; systemOnline = null; updateStatusDisplay();
-  client = mqtt.connect(BROKER_URL, {
-    username: creds.username,
-    password: creds.password,
-    reconnectPeriod: 2000,   // retry every 2s while disconnected
-    keepalive: 20,           // notice a dead connection within ~30s
-    connectTimeout: 10000,
-  });
+  client = relayConnect(RELAY_URL, token);
   client.on('connect', () => {
     // After a reconnect, re-fetch the log so events missed while disconnected show up
     if (everConnected) loadLogHistory();
@@ -1165,7 +1205,7 @@ function connectMqtt(creds) {
   client.on('close', () => { brokerConnected = false; systemOnline = null; updateStatusDisplay(); });
   client.on('message', onMqttMessage);
   // Shows WHY a connection fails in the browser console (F12), e.g. "Not authorized"
-  client.on('error', err => console.warn(`MQTT error (${creds.username}):`, err && err.message ? err.message : err));
+  client.on('error', err => console.warn(`Relay error (${token ? 'admin' : 'viewer'}):`, err && err.message ? err.message : err));
 }
 
 // Sends a command (admins only) and records who did it in the admin audit trail
@@ -1336,17 +1376,17 @@ function applyAuthUI() {
   updatePumpButton();
 }
 
-function startSession(token, user, mqttCreds) {
+function startSession(token, user) {
   session = { token, user };
   storeToken(token);
   applyAuthUI();
-  connectMqtt(mqttCreds);
+  connectMqtt(token);
 }
 function endSession(message) {
   session = null;
   storeToken(null);
   applyAuthUI();
-  connectMqtt(VIEWER_MQTT);
+  connectMqtt(VIEWER);
   if (message) alert(message);
 }
 
@@ -1371,7 +1411,7 @@ async function submitLogin() {
     const { ok, data } = await apiFetch('/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) });
     if (!ok) { err.textContent = (data && data.error) || 'Login failed.'; return; }
     closeLogin();
-    startSession(data.token, data.user, data.mqtt);
+    startSession(data.token, data.user);
   } catch (e) {
     err.textContent = 'Could not reach the server. Check your connection.';
   } finally {
@@ -1444,12 +1484,12 @@ async function initAuth() {
   if (token) {
     try {
       const { ok, data } = await apiFetch('/auth/me', { token });
-      if (ok && data.mqtt) { startSession(token, data.user, data.mqtt); return; }
+      if (ok && data.user) { startSession(token, data.user); return; }
       storeToken(null);
     } catch (e) { /* server unreachable: fall back to preview */ }
   }
   applyAuthUI();
-  connectMqtt(VIEWER_MQTT);
+  connectMqtt(VIEWER);
 }
 
 renderShelves();

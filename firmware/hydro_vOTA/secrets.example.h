@@ -6,11 +6,11 @@
 static const char* WIFI_SSID = "YOUR-WIFI-NAME";
 static const char* WIFI_PASS = "YOUR-WIFI-PASSWORD";
 
-// ---------------- MQTT BROKER (HiveMQ Cloud) ----------------
-// Device credential: needs Publish + Subscribe permission on hydroponics/#
-static const char* MQTT_HOST = "YOUR-CLUSTER.s1.eu.hivemq.cloud";
-static const char* MQTT_USER = "YOUR-DEVICE-USER";
-static const char* MQTT_PASS = "YOUR-DEVICE-PASSWORD";
+// ---------------- LIVE RELAY (Cloudflare Worker + Durable Object) ----------------
+// Host name only: no "https://", no path. The firmware connects to wss://<host>/ws
+static const char* RELAY_HOST = "YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev";
+// Must match the Worker secret DEVICE_KEY. Use a long random string, used nowhere else.
+static const char* DEVICE_KEY = "SAME-VALUE-AS-THE-WORKER-DEVICE_KEY-SECRET";
 
 // ---------------- EVENT LOG (Cloudflare Worker) ----------------
 // While the URL still contains "YOUR-SUBDOMAIN", cloud logging is switched off automatically.

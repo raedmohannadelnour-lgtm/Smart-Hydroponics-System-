@@ -9,7 +9,8 @@
 //   - Manual mode does NOT pause the schedules; they keep running in the background and
 //     take control of the relays again when Automatic mode resumes.
 //
-//  LIBRARIES: esp32 board package (Espressif), PubSubClient (Nick O'Leary).
+//  LIBRARIES: esp32 board package (Espressif), WebSockets (Markus Sattler),
+//             ArduinoJson (Benoit Blanchon, v7).
 //  PARTITION: Tools -> Partition Scheme -> "Minimal SPIFFS (1.9MB APP with OTA)" (any scheme
 //  "with OTA" works; never "Huge APP / No OTA", or wireless updates are impossible).
 //  WIRELESS UPDATES: see the WIRELESS FIRMWARE UPDATES settings below.
@@ -18,21 +19,22 @@
 //  FILE LAYOUT (in order)
 //    YOUR SETTINGS  - WiFi, HiveMQ login, log URL/key, pin wiring  <- the only part to edit
 //    topics + globals
-//    logging        - logEvent() -> Serial + MQTT + background upload task (logTask)
+//    relay link     - RelayClient: secure WebSocket to the Cloudflare Durable Object relay
+//    logging        - logEvent() -> Serial + relay + background upload task (logTask)
 //    relays         - setRelay(), setAllLeds(), load/save states in flash (Preferences)
 //    tank           - debounced float switch
 //    clock          - NTP time, cyclePos() works out each schedule's position
 //    schedules      - runSchedules() (both modes), setLightStart/Schedule/PumpSchedule, reset
-//    MQTT           - onMqttMessage() handles commands, maintainConnections() never blocks
+//    messages       - onMqttMessage() handles commands, maintainConnections() never blocks
 //    setup() / loop()
 //
-//  Full guide (wiring, rebuild, troubleshooting, MQTT topics):
-//  "Lamba Smart Hydroponics - System Guide".
+//  Full guide (setup, topics): docs/SETUP.md in the repository.
 // =====================================================================================
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <PubSubClient.h>
+#include <WebSocketsClient.h>   // library "WebSockets" by Markus Sattler
+#include <ArduinoJson.h>        // library "ArduinoJson" by Benoit Blanchon (v7)
 #include <Preferences.h>
 #include <esp_system.h>
 #include <time.h>
@@ -43,13 +45,10 @@
 // =====================================================================================
 //  YOUR SETTINGS
 // =====================================================================================
-// WiFi, MQTT login, log URL/key and the OTA password live in secrets.h (same folder).
+// WiFi, relay host + device key, log URL/key and the OTA password live in secrets.h (same folder).
 // Copy secrets.example.h to secrets.h and fill it in. secrets.h is git-ignored.
 #include "secrets.h"
 
-// ---------------- MQTT BROKER (HiveMQ) ----------------
-static const int   MQTT_PORT = 8883;
-static const char* CLIENT_ID = "esp32-hydroponics";
 
 // ---------------- WIRING ----------------
 // Order: Shelf 1 (bottom), Shelf 2, Shelf 3, Shelf 4 (top), Pump.
@@ -179,7 +178,6 @@ uint8_t pumpOverride = PUMP_AUTO;       // saved in flash
 
 // ---------------- CONNECTIVITY ----------------
 const unsigned long WIFI_RETRY_MS = 15000;
-const unsigned long MQTT_RETRY_MS = 5000;
 bool mqttWasConnected = false;
 unsigned long mqttLostAt = 0;
 unsigned long mqttConnectedAtMs = 0;         // millis() when the current MQTT connection started
@@ -189,13 +187,78 @@ unsigned long mqttConnectedAtMs = 0;         // millis() when the current MQTT c
 const unsigned long WIFI_FULL_RESET_MS  = 2UL * 60UL * 1000UL;   // WiFi down this long -> full WiFi restart
 const unsigned long MQTT_STALE_RESET_MS = 5UL * 60UL * 1000UL;   // WiFi "up" but broker unreachable this long -> full WiFi restart
 bool offlineSawWifiDrop = false;   // during the current outage, did WiFi itself drop?
-int  lastMqttRc = 0;               // last broker connect error (PubSubClient state)
+int  lastMqttRc = 0;               // last relay error (0 = none)
 int  wifiResets = 0;               // full WiFi restarts during the current outage
 long lastRssi = 0;                 // last known WiFi signal strength (dBm)
 
 Preferences preferences;
-WiFiClientSecure wifiClient;
-PubSubClient mqtt(wifiClient);
+
+// =====================================================================================
+//  Live relay link: Cloudflare Durable Object over a secure WebSocket (replaces MQTT)
+//  Same topic names as before. Frames are small JSON objects:
+//    send     {"t":"pub","topic":"...","payload":"...","retain":true}   {"t":"sub","topic":"..."}
+//    receive  {"t":"msg","topic":"...","payload":"..."}
+//  The device proves who it is with the X-Device-Key header (DEVICE_KEY in secrets.h).
+//  When this socket drops, the relay itself sets hydroponics/status = "offline".
+//  Methods mirror the old PubSubClient calls, so the rest of the firmware is unchanged.
+// =====================================================================================
+typedef void (*RelayCallback)(char* topic, byte* payload, unsigned int length);
+
+class RelayClient {
+ public:
+  void begin(const char* host, const char* deviceKey, RelayCallback cb) {
+    cb_ = cb;
+    snprintf(authHeader_, sizeof(authHeader_), "X-Device-Key: %s", deviceKey);
+    ws_.setExtraHeaders(authHeader_);
+    ws_.onEvent([this](WStype_t type, uint8_t* data, size_t len) { onEvent(type, data, len); });
+    ws_.setReconnectInterval(5000);        // retry every 5 s while disconnected
+    ws_.enableHeartbeat(15000, 5000, 2);   // ping every 15 s; 2 missed pongs = dead link
+    // No CA certificate = encrypted but not verified (same as setInsecure() before; see Roadmap).
+    ws_.beginSSL(host, 443, "/ws", nullptr, "");
+  }
+  void loop()            { ws_.loop(); }
+  bool connected() const { return connected_; }
+  int  state() const     { return connected_ ? 0 : -1; }
+  // True once after each new connection, so the main loop can (re)subscribe and publish states
+  bool takeJustConnected() { bool j = justConnected_; justConnected_ = false; return j; }
+
+  bool publish(const char* topic, const char* payload, bool retain = false) {
+    if (!connected_) return false;
+    JsonDocument d;
+    d["t"] = "pub"; d["topic"] = topic; d["payload"] = payload;
+    if (retain) d["retain"] = true;
+    return sendJson(d);
+  }
+  bool subscribe(const char* topic) {
+    if (!connected_) return false;
+    JsonDocument d;
+    d["t"] = "sub"; d["topic"] = topic;
+    return sendJson(d);
+  }
+
+ private:
+  bool sendJson(JsonDocument& d) { String s; serializeJson(d, s); return ws_.sendTXT(s); }
+
+  void onEvent(WStype_t type, uint8_t* data, size_t len) {
+    if (type == WStype_CONNECTED)    { connected_ = true; justConnected_ = true; return; }
+    if (type == WStype_DISCONNECTED) { connected_ = false; return; }
+    if (type != WStype_TEXT || !cb_) return;
+    JsonDocument d;
+    if (deserializeJson(d, data, len)) return;
+    if (strcmp(d["t"] | "", "msg") != 0) return;
+    strlcpy(topicBuf_, d["topic"] | "", sizeof(topicBuf_));
+    const char* payload = d["payload"] | "";
+    cb_(topicBuf_, (byte*)payload, strlen(payload));
+  }
+
+  WebSocketsClient ws_;
+  RelayCallback cb_ = nullptr;
+  char authHeader_[128];
+  char topicBuf_[96];
+  bool connected_ = false, justConnected_ = false;
+};
+
+RelayClient relay;
 
 // ---------------- LOG QUEUE ----------------
 const size_t LOG_MSG_LEN   = 128;
@@ -226,7 +289,7 @@ void logEvent(const char* fmt, ...)
 
   Serial.print("[log] ");
   Serial.println(msg);
-  if (mqtt.connected()) mqtt.publish(LOG_TOPIC, msg);
+  if (relay.connected()) relay.publish(LOG_TOPIC, msg);
   if (logQueue) xQueueSend(logQueue, msg, 0);
 }
 
@@ -299,7 +362,7 @@ void setRelay(uint8_t index, bool on, bool publishState = true, bool logIt = tru
   Serial.print(": ");
   Serial.println(on ? "ON" : "OFF");
 
-  if (publishState) mqtt.publish(STATE_TOPICS[index], on ? "1" : "0", true);
+  if (publishState) relay.publish(STATE_TOPICS[index], on ? "1" : "0", true);
   if (changed && logIt) logEvent("%s turned %s", CHANNEL_NAMES[index], on ? "on" : "off");
 }
 
@@ -317,7 +380,7 @@ void setAllLeds(bool on, const char* reason)
 
 void publishEnabled(uint8_t i)
 {
-  mqtt.publish(ENABLED_STATE_TOPICS[i], shelfEnabled[i] ? "1" : "0", true);
+  relay.publish(ENABLED_STATE_TOPICS[i], shelfEnabled[i] ? "1" : "0", true);
 }
 
 // Master switch for one shelf
@@ -368,7 +431,7 @@ bool readTankFull()
 
 void publishTankState()
 {
-  mqtt.publish(TANK_STATE_TOPIC, tankFull ? "full" : "empty", true);
+  relay.publish(TANK_STATE_TOPIC, tankFull ? "full" : "empty", true);
 }
 
 void updateTankSensor()
@@ -408,7 +471,7 @@ void initTankSensor()
 // ---------------- Pump safety + maintenance switch ----------------
 void publishPumpOverride()
 {
-  mqtt.publish(PUMP_OVERRIDE_STATE_TOPIC,
+  relay.publish(PUMP_OVERRIDE_STATE_TOPIC,
                pumpOverride == PUMP_FORCE_ON ? "on" : pumpOverride == PUMP_FORCE_OFF ? "off" : "none", true);
 }
 
@@ -534,43 +597,43 @@ void publishLightStart()
   ksaClock(lightAnchor, h, m);
   char buf[8];
   snprintf(buf, sizeof(buf), "%02d:%02d", h, m);
-  mqtt.publish(LIGHT_START_STATE_TOPIC, buf, true);
+  relay.publish(LIGHT_START_STATE_TOPIC, buf, true);
 }
 
 void publishPlanted()
 {
   char buf[12];
   snprintf(buf, sizeof(buf), "%lu", (unsigned long)plantedAt);
-  mqtt.publish(PLANTED_STATE_TOPIC, buf, true);
+  relay.publish(PLANTED_STATE_TOPIC, buf, true);
 }
 
 void publishPumpSchedule()
 {
   char buf[12];
   snprintf(buf, sizeof(buf), "%d,%d", pumpOnMin, pumpOffMin);
-  mqtt.publish(PUMP_SCHED_STATE_TOPIC, buf, true);
+  relay.publish(PUMP_SCHED_STATE_TOPIC, buf, true);
 }
 
 // Uptime info for the dashboard's log panel: when the ESP32 powered on, and when the
 // current connection started. Needs the real clock, so it's (re)sent once time is synced.
 void publishUptime()
 {
-  if (!clockValid || !mqtt.connected()) return;
+  if (!clockValid || !relay.connected()) return;
   uint32_t now = (uint32_t)nowEpoch();
   char buf[12];
   snprintf(buf, sizeof(buf), "%lu", (unsigned long)(now - millis() / 1000));
-  mqtt.publish(BOOT_TIME_TOPIC, buf, true);
+  relay.publish(BOOT_TIME_TOPIC, buf, true);
   snprintf(buf, sizeof(buf), "%lu", (unsigned long)(now - (millis() - mqttConnectedAtMs) / 1000));
-  mqtt.publish(CONNECTED_TIME_TOPIC, buf, true);
+  relay.publish(CONNECTED_TIME_TOPIC, buf, true);
 }
 
 void publishAllStates()
 {
-  for (uint8_t i = 0; i < 5; i++) mqtt.publish(STATE_TOPICS[i], relayState[i] ? "1" : "0", true);
-  mqtt.publish(MODE_STATE_TOPIC, autoMode ? "auto" : "manual", true);
+  for (uint8_t i = 0; i < 5; i++) relay.publish(STATE_TOPICS[i], relayState[i] ? "1" : "0", true);
+  relay.publish(MODE_STATE_TOPIC, autoMode ? "auto" : "manual", true);
   char buf[8];
   dtostrf(onHours, 0, 1, buf);
-  mqtt.publish(SCHEDULE_STATE_TOPIC, buf, true);
+  relay.publish(SCHEDULE_STATE_TOPIC, buf, true);
   publishPumpSchedule();
   publishLightStart();
   publishPlanted();
@@ -592,8 +655,8 @@ void setMode(bool toAuto)
     // to whatever the schedules say right now.
     logEvent(toAuto ? "Switched to automatic mode" : "Switched to manual mode (10 min)");
   }
-  mqtt.publish(MODE_STATE_TOPIC, autoMode ? "auto" : "manual", true);
-  for (uint8_t i = 0; i < 5; i++) mqtt.publish(STATE_TOPICS[i], relayState[i] ? "1" : "0", true);
+  relay.publish(MODE_STATE_TOPIC, autoMode ? "auto" : "manual", true);
+  for (uint8_t i = 0; i < 5; i++) relay.publish(STATE_TOPICS[i], relayState[i] ? "1" : "0", true);
 }
 
 // Light hours changed. The lights-on time stays the same; only the off time moves.
@@ -607,7 +670,7 @@ void setSchedule(float newOnHours)
   char onBuf[8], offBuf[8];
   dtostrf(onHours, 0, 1, onBuf);
   dtostrf(24.0 - onHours, 0, 1, offBuf);
-  mqtt.publish(SCHEDULE_STATE_TOPIC, onBuf, true);
+  relay.publish(SCHEDULE_STATE_TOPIC, onBuf, true);
   if (changed) logEvent("Light schedule set: %sh on / %sh off", onBuf, offBuf);
 }
 
@@ -678,7 +741,7 @@ void checkClock()
     if (nowEpoch() < VALID_TIME) return;
   }
   clockValid = true;
-  if (mqtt.connected()) mqtt.publish(CLOCK_STATE_TOPIC, "synced", true);
+  if (relay.connected()) relay.publish(CLOCK_STATE_TOPIC, "synced", true);
   uint32_t now = (uint32_t)nowEpoch();
   bool firstRun = false;
   if (!lightAnchor) { lightAnchor = now; preferences.putUInt("lightAnchor", lightAnchor); firstRun = true; }
@@ -742,13 +805,13 @@ void runSchedules()
     uint32_t lTotal   = lightsPhaseOn ? onSec : DAY_SEC - onSec;
     snprintf(payload, sizeof(payload), "%s,%lu,%lu", lightsPhaseOn ? "on" : "off",
              (unsigned long)lElapsed, (unsigned long)lTotal);
-    mqtt.publish(CYCLE_STATUS_TOPIC, payload);
+    relay.publish(CYCLE_STATUS_TOPIC, payload);
 
     const char* pPhase = pumpPhaseOn ? ((autoMode && !tankFull && pumpOverride == PUMP_AUTO) ? "blocked" : "on") : "off";
     uint32_t pElapsed = pumpPhaseOn ? pumpP : pumpP - pOnSec;
     uint32_t pTotal   = pumpPhaseOn ? pOnSec : (uint32_t)pumpOffMin * 60UL;
     snprintf(payload, sizeof(payload), "%s,%lu,%lu", pPhase, (unsigned long)pElapsed, (unsigned long)pTotal);
-    mqtt.publish(PUMP_CYCLE_STATUS_TOPIC, payload);
+    relay.publish(PUMP_CYCLE_STATUS_TOPIC, payload);
   }
 }
 
@@ -765,7 +828,7 @@ void checkManualTimeout()
   static unsigned long lastBroadcast = 0;
   if (millis() - lastBroadcast >= 1000) {
     lastBroadcast = millis();
-    mqtt.publish(MANUAL_REMAIN_TOPIC, String((MANUAL_TIMEOUT_MS - elapsed) / 1000).c_str());
+    relay.publish(MANUAL_REMAIN_TOPIC, String((MANUAL_TIMEOUT_MS - elapsed) / 1000).c_str());
   }
 }
 
@@ -778,7 +841,7 @@ bool   lanOtaStarted = false;
 void otaStatus(const char* msg)
 {
   Serial.printf("[ota] %s\n", msg);
-  if (mqtt.connected()) { mqtt.publish(OTA_STATE_TOPIC, msg); mqtt.loop(); }
+  if (relay.connected()) { relay.publish(OTA_STATE_TOPIC, msg); relay.loop(); }
 }
 
 // Remember the old version, so after the restart the log can say what changed
@@ -881,16 +944,16 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length)
       // In automatic mode the schedules own the relays: ignore, and re-publish the true
       // state so the dashboard button snaps back.
       if (autoMode) {
-        mqtt.publish(STATE_TOPICS[i], relayState[i] ? "1" : "0", true);
+        relay.publish(STATE_TOPICS[i], relayState[i] ? "1" : "0", true);
         return;
       }
       if (i == PUMP) {
         if (pumpOverride != PUMP_AUTO) {                  // maintenance switch owns the pump
-          mqtt.publish(STATE_TOPICS[i], relayState[i] ? "1" : "0", true);
+          relay.publish(STATE_TOPICS[i], relayState[i] ? "1" : "0", true);
           return;
         }
         if (msg == "1" && !tankFull) {                    // never start the pump on an empty tank
-          mqtt.publish(STATE_TOPICS[i], "0", true);
+          relay.publish(STATE_TOPICS[i], "0", true);
           logEvent("Pump not started - tank empty");
           return;
         }
@@ -911,35 +974,35 @@ void fmtDuration(unsigned long s, char* out, size_t n)
 
 void onMqttConnected()
 {
-  Serial.println("MQTT connected");
+  Serial.println("Relay connected");
   mqttConnectedAtMs = millis();
-  mqtt.publish(STATUS_TOPIC, "online", true);
-  mqtt.publish(CLOCK_STATE_TOPIC, clockValid ? "synced" : "waiting", true);
+  relay.publish(STATUS_TOPIC, "online", true);
+  relay.publish(CLOCK_STATE_TOPIC, clockValid ? "synced" : "waiting", true);
   if (clockValid) {
     publishUptime();
   } else {
     // Clear uptime from a previous run so the dashboard doesn't show stale numbers
-    mqtt.publish(BOOT_TIME_TOPIC, "", true);
-    mqtt.publish(CONNECTED_TIME_TOPIC, "", true);
+    relay.publish(BOOT_TIME_TOPIC, "", true);
+    relay.publish(CONNECTED_TIME_TOPIC, "", true);
   }
   publishAllStates();
-  for (uint8_t i = 0; i < 5; i++) mqtt.subscribe(SET_TOPICS[i]);
-  mqtt.subscribe(MODE_SET_TOPIC);
-  mqtt.subscribe(SCHEDULE_SET_TOPIC);
-  mqtt.subscribe(LIGHT_START_SET_TOPIC);
-  mqtt.subscribe(PUMP_SCHED_SET_TOPIC);
-  mqtt.subscribe(CYCLE_RESET_TOPIC);
-  for (uint8_t i = 0; i < 4; i++) mqtt.subscribe(ENABLED_SET_TOPICS[i]);
-  mqtt.subscribe(PUMP_OVERRIDE_SET_TOPIC);
-  mqtt.subscribe(OTA_SET_TOPIC);
-  mqtt.publish(FIRMWARE_STATE_TOPIC, FW_VERSION, true);
+  for (uint8_t i = 0; i < 5; i++) relay.subscribe(SET_TOPICS[i]);
+  relay.subscribe(MODE_SET_TOPIC);
+  relay.subscribe(SCHEDULE_SET_TOPIC);
+  relay.subscribe(LIGHT_START_SET_TOPIC);
+  relay.subscribe(PUMP_SCHED_SET_TOPIC);
+  relay.subscribe(CYCLE_RESET_TOPIC);
+  for (uint8_t i = 0; i < 4; i++) relay.subscribe(ENABLED_SET_TOPICS[i]);
+  relay.subscribe(PUMP_OVERRIDE_SET_TOPIC);
+  relay.subscribe(OTA_SET_TOPIC);
+  relay.publish(FIRMWARE_STATE_TOPIC, FW_VERSION, true);
 
   if (mqttLostAt != 0) {
     char dur[24];
     fmtDuration((millis() - mqttLostAt) / 1000, dur, sizeof(dur));
     char why[40];
     if (offlineSawWifiDrop) snprintf(why, sizeof(why), "WiFi dropped");
-    else                    snprintf(why, sizeof(why), "WiFi up, broker unreachable rc=%d", lastMqttRc);
+    else                    snprintf(why, sizeof(why), "WiFi up, relay unreachable rc=%d", lastMqttRc);
     logEvent("Back online after %s: %s, %d WiFi restarts, signal %ld dBm",
              dur, why, wifiResets, (long)WiFi.RSSI());
   }
@@ -955,13 +1018,13 @@ void markDisconnected(bool wifiDropped)
   mqttLostAt = millis();
   offlineSawWifiDrop = wifiDropped;
   wifiResets = 0;
-  lastMqttRc = mqtt.state();
-  Serial.println(wifiDropped ? "WiFi lost" : "MQTT connection lost");
+  lastMqttRc = relay.state();
+  Serial.println(wifiDropped ? "WiFi lost" : "Relay connection lost");
   if (clockValid) {
     int h, m;
     ksaClock((uint32_t)nowEpoch(), h, m);
     logEvent("Went offline at %s KSA: %s, last signal %ld dBm",
-             fmt12(h, m), wifiDropped ? "WiFi dropped" : "broker connection lost", lastRssi);
+             fmt12(h, m), wifiDropped ? "WiFi dropped" : "relay connection lost", lastRssi);
   }
 }
 
@@ -981,8 +1044,8 @@ void restartWifi(const char* why)
 void maintainConnections()
 {
   static unsigned long lastWifiKick = 0, lastWifiFullReset = 0;
-  static unsigned long lastMqttAttempt = 0, mqttFailingSince = 0, lastRssiRead = 0;
-  static bool triedMqttOnce = false, wifiWasUp = false;
+  static unsigned long mqttFailingSince = 0, lastRssiRead = 0;
+  static bool wifiWasUp = false;
 
   bool wifiUp = WiFi.status() == WL_CONNECTED;
   if (wifiUp && !wifiWasUp && !clockValid) startNtp();      // ask for the time once WiFi is really up
@@ -1006,29 +1069,19 @@ void maintainConnections()
 
   if (millis() - lastRssiRead > 30000) { lastRssiRead = millis(); lastRssi = WiFi.RSSI(); }
 
-  if (mqtt.connected()) { mqttFailingSince = 0; return; }
+  // The relay library connects and reconnects by itself (every 5 s); here we react to it.
+  if (relay.takeJustConnected()) {
+    mqttWasConnected = true;
+    mqttFailingSince = 0;
+    onMqttConnected();
+  }
+  if (relay.connected()) { mqttFailingSince = 0; return; }
   markDisconnected(false);
 
   if (!mqttFailingSince) mqttFailingSince = millis();
   if (millis() - mqttFailingSince >= MQTT_STALE_RESET_MS) {
     mqttFailingSince = millis();
-    restartWifi("broker unreachable for 5 min");
-    return;
-  }
-
-  if (triedMqttOnce && millis() - lastMqttAttempt < MQTT_RETRY_MS) return;
-  triedMqttOnce = true;
-  lastMqttAttempt = millis();
-
-  Serial.print("Connecting to MQTT...");
-  if (mqtt.connect(CLIENT_ID, MQTT_USER, MQTT_PASS, STATUS_TOPIC, 1, true, "offline")) {
-    mqttWasConnected = true;
-    mqttFailingSince = 0;
-    onMqttConnected();
-  } else {
-    lastMqttRc = mqtt.state();
-    Serial.print("failed, rc=");
-    Serial.println(lastMqttRc);
+    restartWifi("relay unreachable for 5 min");
   }
 }
 
@@ -1065,10 +1118,8 @@ void setup()
   // once synced it re-syncs automatically about once an hour.
   startNtp();
 
-  wifiClient.setInsecure();
-  wifiClient.setHandshakeTimeout(10);
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(onMqttMessage);
+  // Live relay (Cloudflare Durable Object). Connects once WiFi is up; see maintainConnections().
+  relay.begin(RELAY_HOST, DEVICE_KEY, onMqttMessage);
 
   logEvent("Device started (%s), firmware %s, tank %s, %s mode",
            resetReasonText(), FW_VERSION, tankFull ? "full" : "empty", autoMode ? "auto" : "manual");
@@ -1078,7 +1129,7 @@ void setup()
 void loop()
 {
   maintainConnections();
-  mqtt.loop();
+  if (WiFi.status() == WL_CONNECTED) relay.loop();
   if (lanOtaStarted) ArduinoOTA.handle();
   runPendingOta();
   checkClock();

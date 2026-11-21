@@ -1,8 +1,11 @@
-Put project photos and screenshots here, using these names so the main README picks them up:
+Photos and screenshots used by the main README:
 
 - `rack.jpg` - the full rack with the lights on
-- `dashboard.png` - screenshot of the dashboard (admin view)
-- `schedule.png` - screenshot of the Schedule panel
-- `electronics.jpg` - the ESP32 + relay board wiring
+- `plants.jpg` - close-up of the plants under the grow lights
+- `electronics.jpg` - the new controller (ESP32, relay boards, 12 V supply)
+- `float-switch.jpg` - the float switch in the reservoir
+- `enclosure.jpg` - the labelled enclosure beside the reservoir
+- `before-circuit.jpg` - the original controller, before the upgrade
+- `dashboard.png`, `schedule.png` - dashboard screenshots (preview mode)
 
-Before uploading a screenshot, check it doesn't show passwords, the Worker URL, or admin names.
+Before adding a screenshot, check it doesn't show passwords, the Worker URL, or admin names.

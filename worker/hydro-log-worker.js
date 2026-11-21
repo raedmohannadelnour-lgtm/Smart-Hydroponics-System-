@@ -1,25 +1,31 @@
+import { DurableObject } from "cloudflare:workers";
+
 // Cloudflare Worker: Hydroponics backend
+//   - Live messaging (Durable Object)      -> ESP32 <-> dashboards over WebSockets (replaces HiveMQ)
 //   - Event log (KV)                       -> written by the ESP32, read by the dashboard
 //   - Admin accounts, sessions, audit (D1) -> login, "who's online", "who did what"
 //
-// BINDINGS (Worker -> Settings -> Bindings):
-//   LOGS  = KV namespace (already set up)
-//   DB    = D1 database  (Storage & Databases -> D1 -> Create, e.g. "hydro-db")
+// BINDINGS (see wrangler.toml):
+//   RELAY = Durable Object namespace, class HydroRelay (one instance, the "broker")
+//   LOGS  = KV namespace
+//   DB    = D1 database  (e.g. "hydro-db")
 //
 // SECRETS (Worker -> Settings -> Variables and Secrets, type "Secret"):
 //   LOG_KEY          already set; must match LOG_API_KEY in the firmware
 //   SETUP_KEY        a long random string; needed only to create/reset admin accounts
-//   MQTT_ADMIN_USER  HiveMQ credential with "Publish and Subscribe" permission
-//   MQTT_ADMIN_PASS  its password
-//   (given ONLY to logged-in admins, so it never appears in the public page)
+//   DEVICE_KEY       a long random string; must match DEVICE_KEY in the firmware's secrets.h
 //
 // The D1 tables are created automatically on first use; no SQL console needed.
 //
 // ENDPOINTS
 //   GET  /logs                 public: stored event log
 //   POST /logs                 ESP32 only (X-Log-Key header)
-//   POST /auth/login           {username, password} -> {token, user, mqtt}
-//   GET  /auth/me              (Bearer) -> {user, mqtt}; also marks the session active
+//   GET  /ws                   WebSocket to the live relay (see HydroRelay below)
+//                              ESP32: header X-Device-Key = DEVICE_KEY -> role "device"
+//                              Browsers: role "viewer" (read-only); send {t:"auth",token}
+//                              after connecting to become "admin"
+//   POST /auth/login           {username, password} -> {token, user}
+//   GET  /auth/me              (Bearer) -> {user}; also marks the session active
 //   POST /auth/heartbeat       (Bearer) keeps "online now" accurate
 //   POST /auth/logout          (Bearer)
 //   POST /audit                (Bearer) {action}: records what an admin did
@@ -122,10 +128,6 @@ function safeEqual(a, b) {
 }
 
 const publicUser = (u) => ({ username: u.username, displayName: u.display_name });
-const mqttCreds = (env) =>
-  env.MQTT_ADMIN_USER && env.MQTT_ADMIN_PASS
-    ? { username: env.MQTT_ADMIN_USER, password: env.MQTT_ADMIN_PASS }
-    : null;
 
 async function getSession(request, env) {
   const m = (request.headers.get("Authorization") || "").match(/^Bearer ([a-f0-9]{64})$/);
@@ -168,9 +170,6 @@ async function handleLogin(request, env) {
     return json({ error: "Wrong username or password" }, 401);
   }
 
-  const creds = mqttCreds(env);
-  if (!creds) return json({ error: "Server missing MQTT_ADMIN_USER / MQTT_ADMIN_PASS secrets" }, 500);
-
   const token = randomHex(32);
   await env.DB.prepare(
     `INSERT INTO sessions (token, user_id, created_at, last_seen, expires_at, ip, user_agent)
@@ -178,7 +177,7 @@ async function handleLogin(request, env) {
   ).bind(token, user.id, now, now, now + SESSION_TTL_MS, ip,
          (request.headers.get("User-Agent") || "").slice(0, 200)).run();
 
-  return json({ token, user: publicUser(user), mqtt: creds });
+  return json({ token, user: publicUser(user) });
 }
 
 async function handleSetup(request, env) {
@@ -325,6 +324,105 @@ async function handleOtaDownload(env, token) {
   return new Response(value, { headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
 }
 
+// ---------------- Live relay (Durable Object) ----------------
+// A tiny MQTT-style broker. Same topic names as before ("hydroponics/..."), JSON frames:
+//   client -> relay  {t:"sub",  topic}                     subscribe (exact topic); retained value sent back
+//                    {t:"pub",  topic, payload, retain?}   publish (if the role allows it)
+//                    {t:"auth", token}                     browser upgrades to admin with a login token
+//   relay -> client  {t:"msg",  topic, payload}            a message on a subscribed topic
+//                    {t:"auth_ok"} | {t:"auth_err"}        reply to auth
+// When the device's socket closes, the relay publishes hydroponics/status = "offline" (retained),
+// which replaces MQTT's "last will".
+async function handleWebSocket(request, env) {
+  if (request.headers.get("Upgrade") !== "websocket") return text("Expected a WebSocket", 426);
+  // Decide the starting role HERE, so a client can never choose its own role
+  const key = request.headers.get("X-Device-Key");
+  const isDevice = !!env.DEVICE_KEY && !!key && safeEqual(key, env.DEVICE_KEY);
+  if (key && !isDevice) return text("Unauthorized", 401);
+  const headers = new Headers(request.headers);
+  headers.delete("X-Device-Key");
+  headers.set("X-Role", isDevice ? "device" : "viewer");
+  const stub = env.RELAY.get(env.RELAY.idFromName("hydroponics"));
+  return stub.fetch(new Request(request.url, { headers }));
+}
+
+const TOPIC_RE = /^hydroponics\/[a-z0-9_\/]{1,80}$/;
+// Commands an admin may send. Everything else is state that only the device publishes.
+const ADMIN_TOPIC_RE = /^hydroponics\/(?:.+\/set|cycle\/reset|led[1-4]\/planted)$/;
+const MAX_PAYLOAD = 512;
+
+export class HydroRelay extends DurableObject {
+  // WebSocket Hibernation API: the object can sleep between messages without dropping sockets.
+  async fetch(request) {
+    const role = request.headers.get("X-Role") === "device" ? "device" : "viewer";
+    const { 0: client, 1: server } = new WebSocketPair();
+    this.ctx.acceptWebSocket(server, [role]);
+    server.serializeAttachment({ role, subs: [] });
+    if (role === "device") {
+      // Only one device: close any older device socket (e.g. after a silent reconnect)
+      for (const old of this.ctx.getWebSockets("device")) if (old !== server) { try { old.close(1000, "replaced"); } catch {} }
+    }
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch {} }
+
+  async publish(topic, payload, retain) {
+    if (retain) {
+      if (payload === "") await this.ctx.storage.delete("r:" + topic);   // MQTT: empty retained = clear
+      else await this.ctx.storage.put("r:" + topic, payload);
+    }
+    for (const ws of this.ctx.getWebSockets()) {
+      const a = ws.deserializeAttachment();
+      if (a && a.subs.includes(topic)) this.send(ws, { t: "msg", topic, payload });
+    }
+  }
+
+  async webSocketMessage(ws, raw) {
+    if (typeof raw !== "string" || raw.length > 2048) return;
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    const a = ws.deserializeAttachment();
+
+    if (m.t === "auth" && a.role !== "device") {
+      const ok = await this.validSession(String(m.token || ""));
+      a.role = ok ? "admin" : "viewer";
+      ws.serializeAttachment(a);
+      this.send(ws, { t: ok ? "auth_ok" : "auth_err" });
+      return;
+    }
+    const topic = String(m.topic || "");
+    if (!TOPIC_RE.test(topic)) return;
+
+    if (m.t === "sub") {
+      if (!a.subs.includes(topic) && a.subs.length < 100) { a.subs.push(topic); ws.serializeAttachment(a); }
+      const kept = await this.ctx.storage.get("r:" + topic);
+      if (kept !== undefined) this.send(ws, { t: "msg", topic, payload: kept });
+      return;
+    }
+    if (m.t === "pub") {
+      const allowed = a.role === "device" || (a.role === "admin" && ADMIN_TOPIC_RE.test(topic));
+      if (!allowed) return;   // viewers are read-only
+      await this.publish(topic, String(m.payload ?? "").slice(0, MAX_PAYLOAD), !!m.retain);
+    }
+  }
+
+  async webSocketClose(ws) {
+    const a = ws.deserializeAttachment();
+    if (a && a.role === "device" && this.ctx.getWebSockets("device").filter((s) => s !== ws).length === 0) {
+      await this.publish("hydroponics/status", "offline", true);
+    }
+  }
+  async webSocketError(ws) { await this.webSocketClose(ws); }
+
+  // Same session rules as the HTTP API (D1 "sessions" table)
+  async validSession(token) {
+    if (!/^[a-f0-9]{64}$/.test(token) || !this.env.DB) return false;
+    const row = await this.env.DB.prepare(
+      "SELECT expires_at, ended_at FROM sessions WHERE token = ?").bind(token).first();
+    return !!row && !row.ended_at && row.expires_at > Date.now();
+  }
+}
+
 // ---------------- Router ----------------
 export default {
   async fetch(request, env) {
@@ -340,6 +438,7 @@ export default {
         });
       }
       if (pathname === "/logs" && method === "POST") return handleLogPost(request, env);
+      if (pathname === "/ws") return handleWebSocket(request, env);
 
       const ota = pathname.match(/^\/firmware\/ota\/([a-f0-9]{64})\.bin$/);
       if (ota && method === "GET") return handleOtaDownload(env, ota[1]);
@@ -360,7 +459,7 @@ export default {
 
       if (pathname === "/auth/me" && method === "GET") {
         await touch(env, session.token);
-        return json({ user: publicUser(session), mqtt: mqttCreds(env) });
+        return json({ user: publicUser(session) });
       }
       if (pathname === "/auth/heartbeat" && method === "POST") {
         await touch(env, session.token);
